@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 
+from Crypto.Hash import keccak
 import pandas as pd
 import requests
 
 STAKING_REWARDS_GRAPHQL_URL = "https://api.stakingrewards.com/public/query"
 LIDO_LAST_APR_URL = "https://eth-api.lido.fi/v1/protocol/steth/apr/last"
 LIDO_SMA_APR_URL = "https://eth-api.lido.fi/v1/protocol/steth/apr/sma"
+WSTETH_MAINNET_ADDRESS = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+SECONDS_PER_DAY = 24 * 60 * 60
 
 
 def _normalize_yield_value(series: pd.Series) -> pd.Series:
@@ -92,6 +96,141 @@ def build_assumed_eth_yield_history(start_date: str, end_date: str | None = None
         "stake_yield": apr,
         "source": f"assumed_constant_apr_{apr:.4f}",
     })
+
+
+def _function_selector(signature: str) -> str:
+    hasher = keccak.new(digest_bits=256)
+    hasher.update(signature.encode("ascii"))
+    return "0x" + hasher.hexdigest()[:8]
+
+
+def _rpc_post(rpc_url: str, method: str, params: list, request_id: int = 1) -> dict:
+    response = requests.post(
+        rpc_url,
+        json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+        timeout=45,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(f"Ethereum RPC error for {method}: {payload['error']}")
+    return payload["result"]
+
+
+def _get_block(rpc_url: str, block_number: int) -> dict:
+    return _rpc_post(rpc_url, "eth_getBlockByNumber", [hex(block_number), False])
+
+
+def _latest_block_number(rpc_url: str) -> int:
+    return int(_rpc_post(rpc_url, "eth_blockNumber", []), 16)
+
+
+def _find_block_at_or_before_timestamp(rpc_url: str, target_ts: int, latest_block: int | None = None) -> int:
+    latest = latest_block if latest_block is not None else _latest_block_number(rpc_url)
+    latest_ts = int(_get_block(rpc_url, latest)["timestamp"], 16)
+    if target_ts > latest_ts:
+        raise ValueError("target timestamp is after the latest available Ethereum block")
+
+    low, high = 0, latest
+    while low < high:
+        mid = (low + high + 1) // 2
+        mid_ts = int(_get_block(rpc_url, mid)["timestamp"], 16)
+        if mid_ts <= target_ts:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def _eth_call_uint256(rpc_url: str, to_address: str, data: str, block_number: int) -> int:
+    result = _rpc_post(
+        rpc_url,
+        "eth_call",
+        [{"to": to_address, "data": data}, hex(block_number)],
+    )
+    return int(result, 16)
+
+
+def fetch_lido_wsteth_share_rate_history(
+    rpc_url: str,
+    start_date: str,
+    end_date: str | None = None,
+    sample_time_utc: str = "00:00:00",
+    sleep_seconds: float = 0.0,
+) -> pd.DataFrame:
+    """Fetch historical wstETH protocol exchange rate from Ethereum RPC.
+
+    The rate is `wstETH.stEthPerToken() / 1e18`, i.e. stETH per 1 wstETH.
+    This is a protocol exchange rate, not the secondary-market wstETH/ETH price,
+    so it avoids mixing staking accrual with market premium/discount.
+    """
+    start = pd.to_datetime(start_date, errors="raise").date()
+    end = (pd.to_datetime(end_date, errors="raise") if end_date else pd.Timestamp.utcnow()).date()
+    if end < start:
+        raise ValueError("end_date must be on or after start_date")
+
+    selector = _function_selector("stEthPerToken()")
+    latest_block = _latest_block_number(rpc_url)
+    latest_ts = int(_get_block(rpc_url, latest_block)["timestamp"], 16)
+    rows = []
+
+    for date in pd.date_range(start=start, end=end, freq="D"):
+        ts = int(pd.Timestamp(f"{date.date()} {sample_time_utc}", tz="UTC").timestamp())
+        if ts > latest_ts:
+            continue
+        block_number = _find_block_at_or_before_timestamp(rpc_url, ts, latest_block=latest_block)
+        block = _get_block(rpc_url, block_number)
+        raw_rate = _eth_call_uint256(rpc_url, WSTETH_MAINNET_ADDRESS, selector, block_number)
+        rows.append({
+            "date": date.normalize(),
+            "block_number": block_number,
+            "block_timestamp_utc": pd.to_datetime(int(block["timestamp"], 16), unit="s", utc=True).tz_convert(None),
+            "share_rate": raw_rate / 1e18,
+            "exchange_rate": raw_rate / 1e18,
+            "source": "lido_wsteth_stEthPerToken_rpc",
+        })
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "date", "block_number", "block_timestamp_utc", "share_rate", "exchange_rate",
+            "daily_yield_decimal", "annualized_apr_decimal", "annualized_apr_pct", "stake_yield", "source"
+        ])
+
+    out = out.sort_values("date").drop_duplicates("date")
+    out["daily_yield_decimal"] = out["share_rate"].pct_change()
+    out["annualized_apr_decimal"] = out["daily_yield_decimal"] * 365.0
+    out["annualized_apr_pct"] = out["annualized_apr_decimal"] * 100.0
+    out["stake_yield"] = out["annualized_apr_decimal"]
+    return out
+
+
+def validate_lido_yield_panel(df: pd.DataFrame, extreme_apr_abs_threshold: float = 0.50) -> dict:
+    """Return validation diagnostics for a Lido/wstETH daily yield panel."""
+    diagnostics = {
+        "rows": len(df),
+        "duplicate_dates": int(df["date"].duplicated().sum()) if "date" in df else None,
+        "missing_required_columns": [],
+        "missing_daily_dates": [],
+        "negative_daily_yield_rows": 0,
+        "extreme_apr_rows": 0,
+    }
+    required = ["date", "share_rate", "daily_yield_decimal", "annualized_apr_decimal", "annualized_apr_pct"]
+    diagnostics["missing_required_columns"] = [c for c in required if c not in df.columns]
+    if diagnostics["missing_required_columns"]:
+        return diagnostics
+
+    dates = pd.to_datetime(df["date"]).sort_values()
+    if not dates.empty:
+        full_dates = pd.date_range(dates.min(), dates.max(), freq="D")
+        missing = full_dates.difference(pd.DatetimeIndex(dates))
+        diagnostics["missing_daily_dates"] = [d.date().isoformat() for d in missing]
+
+    diagnostics["negative_daily_yield_rows"] = int((df["daily_yield_decimal"].dropna() < 0).sum())
+    diagnostics["extreme_apr_rows"] = int((df["annualized_apr_decimal"].dropna().abs() > extreme_apr_abs_threshold).sum())
+    return diagnostics
 
 
 def fetch_stakingrewards_eth_reward_rate_history(api_key: str, start_date: str, limit: int = 500) -> pd.DataFrame:
