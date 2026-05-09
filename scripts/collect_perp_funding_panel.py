@@ -22,6 +22,10 @@ import pandas as pd
 import requests
 import statsmodels.api as sm
 
+# Non-retryable HTTP failures (e.g., malformed/unsupported request ranges).
+class HTTPNonRetryableError(RuntimeError):
+    """Raised when retrying the same request is not useful."""
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
@@ -109,12 +113,16 @@ def safe_get_json(
             resp = requests.get(url, params=params, timeout=30)
             if resp.status_code in {403, 429} or resp.status_code >= 500:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            if 400 <= resp.status_code < 500:
+                raise HTTPNonRetryableError(f"HTTP {resp.status_code}: {resp.text[:300]}")
             resp.raise_for_status()
             payload = resp.json()
             if bybit and int(payload.get("retCode", 0)) != 0:
                 raise RuntimeError(f"Bybit retCode={payload.get('retCode')}: {payload.get('retMsg')}")
             time.sleep(sleep_sec)
             return payload
+        except HTTPNonRetryableError:
+            raise
         except Exception as exc:  # noqa: BLE001 - surface final exchange/API error cleanly
             last_error = exc
     raise RuntimeError(f"GET failed after {max_retries} attempts: {url} params={params} error={last_error}")
@@ -329,12 +337,34 @@ def fetch_bybit_open_interest(symbol: str, start_date: str, end_date: str, inter
 
 
 def fetch_binance_open_interest_hist(symbol: str, start_date: str, end_date: str, period: str = "1d") -> pd.DataFrame:
-    params = {"symbol": symbol, "period": period, "startTime": to_ms(start_date), "endTime": end_date_inclusive_ms(end_date), "limit": 500}
-    try:
-        rows = safe_get_json(BINANCE_OI_HIST_URL, params=params, sleep_sec=0.2)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Binance openInterestHist failed for {symbol}: {exc}")
-        return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
+    # Binance futures data endpoints often reject very wide start/end ranges.
+    # Query in bounded windows and stitch results.
+    start_dt = _parse_utc(start_date)
+    end_dt = _parse_utc(end_date)
+    window_days = 30 if period == "1d" else 7
+    rows: list[dict[str, Any]] = []
+    current = start_dt
+    while current <= end_dt:
+        window_end = min(current + timedelta(days=window_days) - timedelta(milliseconds=1), end_dt)
+        params = {
+            "symbol": symbol,
+            "period": period,
+            "startTime": to_ms(current),
+            "endTime": to_ms(window_end),
+            "limit": 500,
+        }
+        try:
+            batch = safe_get_json(BINANCE_OI_HIST_URL, params=params, sleep_sec=0.2)
+        except HTTPNonRetryableError as exc:
+            print(f"[WARN] Binance openInterestHist non-retryable for {symbol} window {current.date()}~{window_end.date()}: {exc}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Binance openInterestHist failed for {symbol} window {current.date()}~{window_end.date()}: {exc}")
+            current = window_end + timedelta(milliseconds=1)
+            continue
+        if isinstance(batch, list):
+            rows.extend(batch)
+        current = window_end + timedelta(milliseconds=1)
     df = pd.DataFrame(rows)
     if df.empty:
         return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
@@ -390,7 +420,13 @@ def fetch_binance_klines(
     df["interval"] = interval
     df["source"] = url
     out = df[["exchange", "symbol", "interval", "open_time", "date", "open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote", "source"]]
-    save_csv(out, OUTPUT_DIR_RAW / f"binance_klines_{symbol}_{interval}.csv")
+    if url == BINANCE_MARK_PRICE_KLINES_URL:
+        filename = f"binance_mark_klines_{symbol}_{interval}.csv"
+    elif url == BINANCE_INDEX_PRICE_KLINES_URL:
+        filename = f"binance_index_klines_{symbol}_{interval}.csv"
+    else:
+        filename = f"binance_klines_{symbol}_{interval}.csv"
+    save_csv(out, OUTPUT_DIR_RAW / filename)
     return out
 
 
@@ -486,17 +522,57 @@ def build_oi_features(eth_oi: pd.DataFrame, btc_oi: pd.DataFrame, price_features
 
 
 def fetch_binance_ratio_series(symbol: str, start_date: str, end_date: str, url: str, period: str = "1d") -> pd.DataFrame:
+    def _recent_only() -> pd.DataFrame:
+        """Fallback for endpoints that reject historical start/end parameters."""
+        params = {"symbol": symbol, "period": period, "limit": 500}
+        try:
+            batch = safe_get_json(url, params=params, sleep_sec=0.2)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Binance ratio endpoint recent-only fallback failed for {symbol}: {exc}")
+            return _empty(["date", "symbol"])
+        df_recent = pd.DataFrame(batch)
+        if df_recent.empty:
+            return _empty(["date", "symbol"])
+        df_recent["timestamp"] = pd.to_numeric(df_recent["timestamp"], errors="coerce").astype("int64")
+        df_recent["date"] = df_recent["timestamp"].map(utc_date_from_ms).astype(str)
+        df_recent["symbol"] = symbol
+        print(f"[WARN] Binance ratio endpoint uses recent-only fallback for {symbol}; historical windowing unavailable.")
+        return df_recent.drop_duplicates(["date"]).sort_values("date")
+
     rows: list[dict[str, Any]] = []
-    current = to_ms(start_date)
-    end_ms = end_date_inclusive_ms(end_date)
-    while current <= end_ms:
-        params = {"symbol": symbol, "period": period, "startTime": current, "endTime": end_ms, "limit": 500}
-        batch = safe_get_json(url, params=params, sleep_sec=0.2)
-        if not batch:
-            break
-        rows.extend(batch)
-        last = max(int(x["timestamp"]) for x in batch)
-        current = last + 1
+    start_dt = _parse_utc(start_date)
+    end_dt = _parse_utc(end_date)
+    window_days = 30 if period == "1d" else 7
+    current_dt = start_dt
+    while current_dt <= end_dt:
+        window_end = min(current_dt + timedelta(days=window_days) - timedelta(milliseconds=1), end_dt)
+        current = to_ms(current_dt)
+        end_ms = to_ms(window_end)
+        while current <= end_ms:
+            params = {"symbol": symbol, "period": period, "startTime": current, "endTime": end_ms, "limit": 500}
+            try:
+                batch = safe_get_json(url, params=params, sleep_sec=0.2)
+            except HTTPNonRetryableError as exc:
+                print(f"[WARN] Binance ratio endpoint non-retryable for {symbol} window {current_dt.date()}~{window_end.date()}: {exc}")
+                msg = str(exc).lower()
+                if "starttime" in msg or "endtime" in msg:
+                    return _recent_only()
+                # These endpoints often hard-fail for unsupported historical ranges.
+                # Stop early to avoid noisy repeated warnings.
+                current_dt = end_dt + timedelta(days=1)
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] Binance ratio endpoint failed for {symbol} window {current_dt.date()}~{window_end.date()}: {exc}")
+                break
+            if not batch:
+                break
+            rows.extend(batch)
+            last = max(int(x["timestamp"]) for x in batch)
+            next_start = last + 1
+            if next_start <= current:
+                break
+            current = next_start
+        current_dt = window_end + timedelta(milliseconds=1)
     df = pd.DataFrame(rows)
     if df.empty:
         return _empty(["date", "symbol"])
@@ -571,13 +647,28 @@ def build_binance_basis_features(start_date: str, end_date: str) -> pd.DataFrame
 
 def fetch_steth_discount(start_date: str, end_date: str) -> pd.DataFrame:
     """Fetch stETH/ETH market ratio from CoinGecko as an LST depeg-risk proxy."""
+    from_ts = int(to_ms(start_date) / 1000)
+    to_ts = int(end_date_inclusive_ms(end_date) / 1000)
     try:
-        params = {"vs_currency": "eth", "from": int(to_ms(start_date) / 1000), "to": int(end_date_inclusive_ms(end_date) / 1000)}
+        params = {"vs_currency": "eth", "from": from_ts, "to": to_ts}
         payload = safe_get_json(f"{COINGECKO_BASE}/coins/staked-ether/market_chart/range", params=params, sleep_sec=1.5)
         prices = payload.get("prices", [])
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] stETH discount unavailable: {exc}")
-        return _empty(["date", "steth_price_eth", "steth_discount"])
+        msg = str(exc)
+        # Public CoinGecko API allows only recent history windows.
+        if "10012" in msg or "past 365 days" in msg.lower():
+            fallback_from = max(from_ts, to_ts - 365 * 24 * 60 * 60)
+            print("[WARN] stETH discount full history unavailable on public API; falling back to last 365 days.")
+            try:
+                params = {"vs_currency": "eth", "from": fallback_from, "to": to_ts}
+                payload = safe_get_json(f"{COINGECKO_BASE}/coins/staked-ether/market_chart/range", params=params, sleep_sec=1.5)
+                prices = payload.get("prices", [])
+            except Exception as fallback_exc:  # noqa: BLE001
+                print(f"[WARN] stETH discount fallback failed: {fallback_exc}")
+                return _empty(["date", "steth_price_eth", "steth_discount"])
+        else:
+            print(f"[WARN] stETH discount unavailable: {exc}")
+            return _empty(["date", "steth_price_eth", "steth_discount"])
     df = pd.DataFrame(prices, columns=["timestamp", "steth_price_eth"])
     if df.empty:
         return _empty(["date", "steth_price_eth", "steth_discount"])
@@ -708,6 +799,11 @@ def run_model_ladder(master: pd.DataFrame, exchange: str, maxlags: int = 7) -> t
         missing = [c for c in cols if c not in master.columns]
         if missing:
             print(f"[WARN] {exchange} {name} skipped; missing columns={missing}")
+            continue
+        reg_data = master[["spread", *cols]].replace([np.inf, -np.inf], np.nan).dropna()
+        min_n = len(cols) + 6
+        if len(reg_data) < min_n:
+            print(f"[WARN] {exchange} {name} skipped; insufficient complete rows n={len(reg_data)} (<{min_n})")
             continue
         try:
             res = ols_hac(master["spread"], master[cols], maxlags=maxlags)

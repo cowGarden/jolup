@@ -49,6 +49,11 @@ OPTIONAL_CONTROLS = [
 ]
 ROLLING_WINDOWS = [180, 365]
 REGRESSION_MIN_NOBS = 30
+STAKE_YIELD_CANDIDATES = [
+    "eth_yield_panel.csv",
+    "lido_wsteth_share_rate.csv",
+    "lido_staking_yield_daily.csv",
+]
 
 
 
@@ -94,6 +99,50 @@ def load_master(exchange: str, input_dir: Path) -> pd.DataFrame | None:
     df = pd.read_csv(path)
     print(f"Loaded {exchange}: {path} ({len(df):,} rows)")
     return df
+
+
+def load_stake_yield_series(input_dir: Path) -> pd.DataFrame | None:
+    """Load a canonical stake_yield time series from processed candidates."""
+    for filename in STAKE_YIELD_CANDIDATES:
+        path = input_dir / filename
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        if "stake_yield" not in df.columns and "annualized_apr_decimal" in df.columns:
+            df["stake_yield"] = df["annualized_apr_decimal"]
+        if not {"date", "stake_yield"}.issubset(df.columns):
+            print(f"[WARN] {path} has no (date, stake_yield); skipping.")
+            continue
+        out = df[["date", "stake_yield"]].copy()
+        out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.date.astype(str)
+        out["stake_yield"] = pd.to_numeric(out["stake_yield"], errors="coerce")
+        out = out.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+        print(f"[INFO] Loaded stake_yield fallback: {path} ({len(out):,} rows)")
+        return out
+    print("[WARN] No fallback stake_yield CSV found in input-dir.")
+    return None
+
+
+def attach_stake_yield_if_missing(df: pd.DataFrame, stake_yield: pd.DataFrame | None, exchange: str) -> pd.DataFrame:
+    """Attach stake_yield by date when master is missing or sparse."""
+    if stake_yield is None or "date" not in df.columns:
+        return df
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.date.astype(str)
+    if "stake_yield" not in out.columns:
+        out = out.merge(stake_yield, on="date", how="left")
+        filled = int(out["stake_yield"].notna().sum())
+        print(f"[INFO] {exchange}: attached missing stake_yield by date (non-null rows={filled:,}).")
+        return out
+    before = int(pd.to_numeric(out["stake_yield"], errors="coerce").notna().sum())
+    fallback = stake_yield.rename(columns={"stake_yield": "stake_yield_fallback"})
+    out = out.merge(fallback, on="date", how="left")
+    out["stake_yield"] = pd.to_numeric(out["stake_yield"], errors="coerce").fillna(out["stake_yield_fallback"])
+    out = out.drop(columns=["stake_yield_fallback"])
+    after = int(out["stake_yield"].notna().sum())
+    if after > before:
+        print(f"[INFO] {exchange}: filled missing stake_yield from fallback ({before:,} -> {after:,}).")
+    return out
 
 
 def validate_master_df(df: pd.DataFrame, exchange: str) -> tuple[pd.DataFrame, list[str]]:
@@ -921,11 +970,17 @@ def main() -> None:
     ensure_dirs(args.results_dir, args.figures_dir)
     exchange_dfs: dict[str, pd.DataFrame] = {}
     outputs: dict[str, ExchangeOutputs] = {}
+    stake_yield_series = load_stake_yield_series(args.input_dir)
     for exchange in args.exchanges:
         raw = load_master(exchange, args.input_dir)
         if raw is None:
             continue
-        df, out = run_exchange(exchange, raw, args.results_dir, args.figures_dir, args.hac_lags)
+        raw = attach_stake_yield_if_missing(raw, stake_yield_series, exchange)
+        try:
+            df, out = run_exchange(exchange, raw, args.results_dir, args.figures_dir, args.hac_lags)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] {exchange}: analysis failed and will be skipped: {exc}")
+            continue
         exchange_dfs[exchange] = df
         outputs[exchange] = out
     pooled = run_pooled_exchange_comparison(exchange_dfs, args.results_dir) if exchange_dfs else pd.DataFrame()
