@@ -38,6 +38,8 @@ OUTPUT_DIR_PROCESSED = ROOT / "data" / "processed"
 LIDO_YIELD_CANDIDATES = [
     OUTPUT_DIR_PROCESSED / "lido_staking_yield_daily.csv",
     OUTPUT_DIR_PROCESSED / "eth_yield_panel.csv",
+    OUTPUT_DIR_PROCESSED / "lido_eth_yield_panel.csv",
+    OUTPUT_DIR_PROCESSED / "lido_yield_panel.csv",
     OUTPUT_DIR_PROCESSED / "lido_wsteth_share_rate.csv",
 ]
 
@@ -336,48 +338,68 @@ def fetch_bybit_open_interest(symbol: str, start_date: str, end_date: str, inter
     return out
 
 
+def _binance_futures_data_start_floor(max_days: int = 30) -> datetime:
+    """Return the oldest timestamp accepted by Binance futures/data metrics endpoints.
+
+    Binance documents openInterestHist and long/short metric endpoints as recent
+    metrics feeds. In practice, requests with startTime older than the latest
+    30 days can fail with "startTime is invalid", so callers clamp historical
+    requests before sending them to Binance and use another OI source when a
+    longer research sample is required.
+    """
+    now_utc = datetime.now(timezone.utc)
+    return now_utc - timedelta(days=max_days) + timedelta(milliseconds=1)
+
+
 def fetch_binance_open_interest_hist(symbol: str, start_date: str, end_date: str, period: str = "1d") -> pd.DataFrame:
-    # Binance futures data endpoints often reject very wide start/end ranges.
-    # Query in bounded windows and stitch results.
-    start_dt = _parse_utc(start_date)
+    # Binance futures/data openInterestHist is a recent metrics endpoint: the
+    # official connector notes that only the latest 30 days are available. Clamp
+    # before requesting to avoid deterministic "startTime is invalid" 400s.
+    requested_start = _parse_utc(start_date)
     end_dt = _parse_utc(end_date)
-    window_days = 30 if period == "1d" else 7
-    rows: list[dict[str, Any]] = []
-    current = start_dt
-    while current <= end_dt:
-        window_end = min(current + timedelta(days=window_days) - timedelta(milliseconds=1), end_dt)
-        params = {
-            "symbol": symbol,
-            "period": period,
-            "startTime": to_ms(current),
-            "endTime": to_ms(window_end),
-            "limit": 500,
-        }
+    start_dt = max(requested_start, _binance_futures_data_start_floor(max_days=30))
+    if start_dt > end_dt:
+        print(f"[WARN] Binance openInterestHist requested range is outside the latest 30 days for {symbol}.")
+        return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
+    if start_dt > requested_start:
+        print(
+            f"[WARN] Binance openInterestHist only exposes recent history; "
+            f"clamped {symbol} OI start from {requested_start.date()} to {start_dt.date()}."
+        )
+
+    params = {
+        "symbol": symbol,
+        "period": period,
+        "startTime": to_ms(start_dt),
+        "endTime": end_date_inclusive_ms(end_dt),
+        "limit": 500,
+    }
+    try:
+        batch = safe_get_json(BINANCE_OI_HIST_URL, params=params, sleep_sec=0.2)
+    except HTTPNonRetryableError as exc:
+        print(f"[WARN] Binance openInterestHist rejected bounded request for {symbol}: {exc}")
+        print(f"[WARN] Retrying Binance openInterestHist for {symbol} without startTime/endTime (recent-only).")
         try:
-            batch = safe_get_json(BINANCE_OI_HIST_URL, params=params, sleep_sec=0.2)
-        except HTTPNonRetryableError as exc:
-            print(f"[WARN] Binance openInterestHist non-retryable for {symbol} window {current.date()}~{window_end.date()}: {exc}")
-            break
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] Binance openInterestHist failed for {symbol} window {current.date()}~{window_end.date()}: {exc}")
-            current = window_end + timedelta(milliseconds=1)
-            continue
-        if isinstance(batch, list):
-            rows.extend(batch)
-        current = window_end + timedelta(milliseconds=1)
-    df = pd.DataFrame(rows)
+            batch = safe_get_json(BINANCE_OI_HIST_URL, params={"symbol": symbol, "period": period, "limit": 500}, sleep_sec=0.2)
+        except Exception as fallback_exc:  # noqa: BLE001
+            print(f"[WARN] Binance openInterestHist recent-only fallback failed for {symbol}: {fallback_exc}")
+            return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Binance openInterestHist failed for {symbol}: {exc}")
+        return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
+
+    df = pd.DataFrame(batch if isinstance(batch, list) else [])
     if df.empty:
         return _empty(["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"])
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").astype("int64")
     df["open_interest_raw"] = pd.to_numeric(df.get("sumOpenInterest"), errors="coerce")
     df["open_interest_usd"] = pd.to_numeric(df.get("sumOpenInterestValue"), errors="coerce")
+    df = df[(df["timestamp"] >= to_ms(start_dt)) & (df["timestamp"] <= end_date_inclusive_ms(end_dt))]
     df = df.drop_duplicates(["timestamp"]).sort_values("timestamp")
     df["date"] = df["timestamp"].map(utc_date_from_ms).astype(str)
     df["exchange"] = "binance"
     df["symbol"] = symbol
     df["source"] = BINANCE_OI_HIST_URL
-    if df["date"].min() > start_date or len(df) < (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days * 0.8:
-        print("[WARN] Binance openInterestHist coverage is insufficient for the requested sample; use Bybit or other source.")
     out = df[["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"]]
     save_csv(out, OUTPUT_DIR_RAW / f"binance_oi_{symbol}.csv")
     return out
@@ -500,12 +522,21 @@ def build_price_features(daily: dict[str, pd.DataFrame], hourly: dict[str, pd.Da
     return out
 
 
+def _first_non_null(values: pd.Series) -> str | None:
+    non_null = values.dropna()
+    return str(non_null.iloc[0]) if not non_null.empty else None
+
+
 def build_oi_features(eth_oi: pd.DataFrame, btc_oi: pd.DataFrame, price_features: pd.DataFrame, exchange: str) -> pd.DataFrame:
     eth = eth_oi.rename(columns={"open_interest_raw": "oi_eth_raw", "open_interest_usd": "oi_eth_usd"})
     btc = btc_oi.rename(columns={"open_interest_raw": "oi_btc_raw", "open_interest_usd": "oi_btc_usd"})
     keep_eth = [c for c in ["date", "oi_eth_raw", "oi_eth_usd"] if c in eth.columns]
     keep_btc = [c for c in ["date", "oi_btc_raw", "oi_btc_usd"] if c in btc.columns]
     out = eth[keep_eth].merge(btc[keep_btc], on="date", how="inner").sort_values("date")
+    if out.empty:
+        out = _empty(["date", "oi_eth_raw", "oi_btc_raw", "oi_eth_usd", "oi_btc_usd", "dlog_oi_eth", "dlog_oi_btc", "oi_eth_btc", "oi_ratio", "exchange", "oi_source_exchange"])
+        save_csv(out, OUTPUT_DIR_PROCESSED / f"{exchange}_oi_features_daily.csv")
+        return out
     prices = price_features[["date", "eth_close", "btc_close"]]
     out = out.merge(prices, on="date", how="left")
     if "oi_eth_usd" not in out or out["oi_eth_usd"].isna().all():
@@ -517,6 +548,8 @@ def build_oi_features(eth_oi: pd.DataFrame, btc_oi: pd.DataFrame, price_features
     out["oi_eth_btc"] = out["dlog_oi_eth"] - out["dlog_oi_btc"]
     out["oi_ratio"] = np.log(out["oi_eth_usd"] / out["oi_btc_usd"])
     out["exchange"] = exchange
+    source_exchange = _first_non_null(eth_oi.get("exchange", pd.Series(dtype=object))) or _first_non_null(btc_oi.get("exchange", pd.Series(dtype=object)))
+    out["oi_source_exchange"] = source_exchange or exchange
     save_csv(out, OUTPUT_DIR_PROCESSED / f"{exchange}_oi_features_daily.csv")
     return out
 
@@ -540,8 +573,14 @@ def fetch_binance_ratio_series(symbol: str, start_date: str, end_date: str, url:
         return df_recent.drop_duplicates(["date"]).sort_values("date")
 
     rows: list[dict[str, Any]] = []
-    start_dt = _parse_utc(start_date)
+    requested_start = _parse_utc(start_date)
     end_dt = _parse_utc(end_date)
+    start_dt = max(requested_start, _binance_futures_data_start_floor(max_days=30))
+    if start_dt > requested_start:
+        print(
+            f"[WARN] Binance ratio endpoint only exposes recent history; "
+            f"clamped {symbol} start from {requested_start.date()} to {start_dt.date()}."
+        )
     window_days = 30 if period == "1d" else 7
     current_dt = start_dt
     while current_dt <= end_dt:
@@ -782,6 +821,17 @@ def ols_hac(y: pd.Series, X: pd.DataFrame, maxlags: int = 7):
     return sm.OLS(data["y"], X_).fit(cov_type="HAC", cov_kwds={"maxlags": maxlags})
 
 
+def _missing_counts_for_model(master: pd.DataFrame, required_cols: list[str]) -> str:
+    counts = []
+    for col in required_cols:
+        if col in master.columns:
+            n_missing = int(master[col].replace([np.inf, -np.inf], np.nan).isna().sum())
+            counts.append(f"{col}:{n_missing}")
+        else:
+            counts.append(f"{col}:missing_column")
+    return ";".join(counts)
+
+
 def run_model_ladder(master: pd.DataFrame, exchange: str, maxlags: int = 7) -> tuple[pd.DataFrame, dict[str, Any]]:
     models = {
         "M1": ["stake_yield"],
@@ -795,19 +845,43 @@ def run_model_ladder(master: pd.DataFrame, exchange: str, maxlags: int = 7) -> t
     }
     results: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
+    availability_rows: list[dict[str, Any]] = []
     for name, cols in models.items():
-        missing = [c for c in cols if c not in master.columns]
+        required = ["spread", *cols]
+        missing = [c for c in required if c not in master.columns]
+        min_n = len(cols) + 6
+        complete_rows = 0
+        if not missing:
+            complete_rows = len(master[required].replace([np.inf, -np.inf], np.nan).dropna())
+        availability = {
+            "exchange": exchange,
+            "model": name,
+            "status": "pending",
+            "complete_rows": complete_rows,
+            "min_required_rows": min_n,
+            "missing_columns": ",".join(missing),
+            "missing_value_counts": _missing_counts_for_model(master, required),
+            "controls": ",".join(cols),
+            "reason": "",
+        }
         if missing:
+            availability["status"] = "skipped"
+            availability["reason"] = f"missing columns: {missing}"
+            availability_rows.append(availability)
             print(f"[WARN] {exchange} {name} skipped; missing columns={missing}")
             continue
-        reg_data = master[["spread", *cols]].replace([np.inf, -np.inf], np.nan).dropna()
-        min_n = len(cols) + 6
-        if len(reg_data) < min_n:
-            print(f"[WARN] {exchange} {name} skipped; insufficient complete rows n={len(reg_data)} (<{min_n})")
+        if complete_rows < min_n:
+            availability["status"] = "skipped"
+            availability["reason"] = f"insufficient complete rows n={complete_rows} (<{min_n})"
+            availability_rows.append(availability)
+            print(f"[WARN] {exchange} {name} skipped; insufficient complete rows n={complete_rows} (<{min_n})")
             continue
         try:
             res = ols_hac(master["spread"], master[cols], maxlags=maxlags)
         except Exception as exc:  # noqa: BLE001
+            availability["status"] = "failed"
+            availability["reason"] = str(exc)
+            availability_rows.append(availability)
             print(f"[WARN] {exchange} {name} failed: {exc}")
             continue
         results[name] = res
@@ -825,26 +899,81 @@ def run_model_ladder(master: pd.DataFrame, exchange: str, maxlags: int = 7) -> t
             "stake_yield_sig_5pct": pval < 0.05,
             "controls": ",".join(cols),
         })
+        availability["status"] = "estimated"
+        availability["complete_rows"] = int(res.nobs)
+        availability_rows.append(availability)
         print(f"[MODEL] {exchange} {name}: stake_yield coef={coef:.6g}, p={pval:.4g}, n={int(res.nobs)}")
+    availability_report = pd.DataFrame(availability_rows)
+    save_csv(availability_report, OUTPUT_DIR_PROCESSED / f"model_availability_report_{exchange}.csv")
     summary = pd.DataFrame(rows)
     save_csv(summary, OUTPUT_DIR_PROCESSED / f"ols_hac_model_summary_{exchange}.csv")
     return summary, results
 
 
+def _empty_oi_raw() -> dict[str, pd.DataFrame]:
+    cols = ["exchange", "symbol", "timestamp", "date", "open_interest_raw", "open_interest_usd", "source"]
+    return {symbol: _empty(cols) for symbol in SYMBOLS}
+
+
+def _oi_complete_days(oi_raw: dict[str, pd.DataFrame]) -> int:
+    if any(oi_raw.get(symbol, pd.DataFrame()).empty for symbol in SYMBOLS):
+        return 0
+    eth_dates = set(oi_raw["ETHUSDT"].get("date", pd.Series(dtype=object)).dropna().astype(str))
+    btc_dates = set(oi_raw["BTCUSDT"].get("date", pd.Series(dtype=object)).dropna().astype(str))
+    return len(eth_dates & btc_dates)
+
+
+def _requested_days(start_date: str, end_date: str) -> int:
+    return max((pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 1, 1)
+
+
+def _fetch_oi_raw_for_exchange(exchange: str, start_date: str, end_date: str, oi_source: str) -> dict[str, pd.DataFrame]:
+    if oi_source == "none":
+        print(f"[WARN] OI source disabled for {exchange}; OI-dependent models will be unavailable.")
+        return _empty_oi_raw()
+
+    if exchange == "bybit":
+        if oi_source == "binance":
+            print("[WARN] --oi-source=binance is ignored for Bybit panel; using Bybit OI.")
+        return {s: fetch_bybit_open_interest(s, start_date, end_date) for s in SYMBOLS}
+
+    def _fetch_binance() -> dict[str, pd.DataFrame]:
+        return {s: fetch_binance_open_interest_hist(s, start_date, end_date) for s in SYMBOLS}
+
+    def _fetch_bybit_fallback() -> dict[str, pd.DataFrame]:
+        print("[WARN] Using Bybit OI as fallback/source for Binance master panel.")
+        return {s: fetch_bybit_open_interest(s, start_date, end_date) for s in SYMBOLS}
+
+    if oi_source == "bybit":
+        return _fetch_bybit_fallback()
+    if oi_source == "binance":
+        return _fetch_binance()
+
+    oi_raw = _fetch_binance()
+    complete_days = _oi_complete_days(oi_raw)
+    requested_days = _requested_days(start_date, end_date)
+    if complete_days < min(60, requested_days * 0.5):
+        print(
+            f"[WARN] Binance OI coverage has {complete_days} complete ETH/BTC days "
+            f"for a {requested_days}-day requested sample; falling back to Bybit OI."
+        )
+        oi_raw = _fetch_bybit_fallback()
+    return oi_raw
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def collect_exchange_panel(exchange: str, start_date: str, end_date: str, hourly: bool = True) -> dict[str, pd.DataFrame]:
+def collect_exchange_panel(exchange: str, start_date: str, end_date: str, hourly: bool = True, oi_source: str = "auto") -> dict[str, pd.DataFrame]:
     if exchange == "binance":
         funding_raw = fetch_binance_funding_all(SYMBOLS, start_date, end_date)
         daily_klines = {s: fetch_binance_klines(s, "1d", start_date, end_date) for s in SYMBOLS}
         hourly_klines = {s: fetch_binance_klines(s, "1h", start_date, end_date) for s in SYMBOLS} if hourly else None
-        oi_raw = {s: fetch_binance_open_interest_hist(s, start_date, end_date) for s in SYMBOLS}
+        oi_raw = _fetch_oi_raw_for_exchange(exchange, start_date, end_date, oi_source)
     elif exchange == "bybit":
         funding_raw = fetch_bybit_funding_all(SYMBOLS, start_date, end_date)
         daily_klines = {s: fetch_bybit_klines(s, "1d", start_date, end_date) for s in SYMBOLS}
         hourly_klines = {s: fetch_bybit_klines(s, "1h", start_date, end_date) for s in SYMBOLS} if hourly else None
-        oi_raw = {s: fetch_bybit_open_interest(s, start_date, end_date) for s in SYMBOLS}
+        oi_raw = _fetch_oi_raw_for_exchange(exchange, start_date, end_date, oi_source)
     else:
         raise ValueError(f"Unsupported exchange={exchange}")
     funding_daily = {s: funding_to_daily_annualized(funding_raw[s], exchange=exchange, symbol=s) for s in SYMBOLS}
@@ -870,6 +999,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lido-yield-csv", default=None, help="CSV with date,stake_yield; defaults to processed Lido candidates")
     p.add_argument("--skip-hourly", action="store_true", help="Skip hourly klines/RV to reduce API calls")
     p.add_argument("--skip-optional", action="store_true", help="Skip optional basis, taker, long-short, and stETH controls")
+    p.add_argument(
+        "--oi-source",
+        choices=["auto", "binance", "bybit", "none"],
+        default="auto",
+        help="OI source for Binance panels: auto tries Binance recent metrics then falls back to Bybit; bybit forces fallback; none disables OI.",
+    )
     p.add_argument("--hac-lags", type=int, default=7, help="Newey-West/HAC max lags")
     return p.parse_args()
 
@@ -889,7 +1024,7 @@ def main() -> None:
     summaries = []
     for exchange in exchanges:
         try:
-            panel = collect_exchange_panel(exchange, args.start_date, args.end_date, hourly=not args.skip_hourly)
+            panel = collect_exchange_panel(exchange, args.start_date, args.end_date, hourly=not args.skip_hourly, oi_source=args.oi_source)
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] Exchange panel failed for {exchange}: {exc}")
             continue
