@@ -138,3 +138,48 @@ python scripts/build_eth_yield_panel.py \
 6. 공용 함수는 `common/`에 추가해 재사용
 
 > Binance 선물 API가 국가/환경에 따라 HTTP 451을 반환할 수 있습니다. 이 경우 `--funding-source bybit` 또는 기본 `auto` 모드를 사용하세요.
+
+## ETH-BTC perpetual funding spread master panel
+
+`scripts/collect_perp_funding_panel.py` is the full data-collection and model-estimation entry point for the thesis question: whether ETH staking yield is reflected in the ETH-BTC perpetual futures funding spread.
+
+Example smoke-friendly command that avoids the largest optional downloads:
+
+```bash
+python scripts/collect_perp_funding_panel.py \
+  --start-date 2023-01-01 \
+  --end-date 2024-12-31 \
+  --exchange both \
+  --skip-hourly \
+  --skip-optional
+```
+
+Full command, including hourly realized volatility, optional Binance basis/taker/long-short controls, stETH discount, and OLS-HAC model summaries:
+
+```bash
+python scripts/collect_perp_funding_panel.py \
+  --start-date 2023-01-01 \
+  --exchange both \
+  --lido-yield-csv data/processed/lido_staking_yield_daily.csv
+```
+
+Main outputs:
+
+- Raw funding: `data/raw/binance_funding_BTCUSDT.csv`, `data/raw/binance_funding_ETHUSDT.csv`, `data/raw/bybit_funding_BTCUSDT.csv`, `data/raw/bybit_funding_ETHUSDT.csv`
+- Raw OI: `data/raw/bybit_oi_BTCUSDT.csv`, `data/raw/bybit_oi_ETHUSDT.csv`, plus Binance OI if the API returns enough recent data
+- Raw klines: `data/raw/{exchange}_klines_{symbol}_{interval}.csv`
+- Daily funding spreads: `data/processed/{exchange}_eth_btc_funding_spread_daily.csv`
+- Price/RV/volume controls: `data/processed/{exchange}_price_features_daily.csv`
+- OI controls: `data/processed/{exchange}_oi_features_daily.csv`
+- Master panels: `data/processed/master_{exchange}_eth_btc_funding_staking_daily.csv`
+- OLS-HAC summaries: `data/processed/ols_hac_model_summary_{exchange}.csv` and `data/processed/ols_hac_model_summary_all_exchanges.csv`
+- Coverage diagnostics: `data/processed/data_coverage_report.csv`
+
+Implementation notes:
+
+1. Binance funding uses forward pagination with `startTime`, `endTime`, and `next_start = last_fundingTime + 1` so it does not stop after a single 1000-row page.
+2. Bybit funding uses backward pagination from `endTime`; each page moves to `oldest_fundingRateTimestamp - 1`, then trims and sorts the final sample in ascending UTC date order.
+3. Daily funding is annualized as `sum(intraday fundingRate) * 365`, with rates stored in decimal units.
+4. OI controls include `oi_eth_btc = dlog_oi_eth - dlog_oi_btc` and `oi_ratio = log(oi_eth_usd / oi_btc_usd)`. If OI is raw coin/contract quantity, the script multiplies by daily close to construct USD notional.
+5. The master panel merges spread, staking yield, price/risk, leverage-demand, liquidity/activity, basis, LST-risk, persistence, and ETF event controls by UTC `date`.
+6. Model summaries estimate M1-M8 with OLS-HAC/Newey-West errors and report the sign and significance of the `stake_yield` coefficient.
