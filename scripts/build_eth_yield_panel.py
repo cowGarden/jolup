@@ -39,6 +39,8 @@ def parse_args():
                    help="UTC time sampled each day for lido-rpc share-rate observations")
     p.add_argument("--rpc-sleep-seconds", type=float, default=0.0,
                    help="Optional delay between daily RPC calls to avoid rate limits")
+    p.add_argument("--no-progress", action="store_true",
+                   help="Disable lido-rpc progress bar output")
     p.add_argument("--stakingrewards-api-key", default=os.getenv("STAKING_REWARDS_API_KEY"),
                    help="Staking Rewards API key; defaults to STAKING_REWARDS_API_KEY env var")
     p.add_argument("--history-limit", type=int, default=500,
@@ -81,6 +83,7 @@ def ensure_yield_input(args) -> Path:
             end_date=args.end_date,
             sample_time_utc=args.sample_time_utc,
             sleep_seconds=args.rpc_sleep_seconds,
+            show_progress=not args.no_progress,
         )
         if df.empty:
             raise RuntimeError("Lido RPC share-rate collection returned no rows.")

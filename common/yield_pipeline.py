@@ -151,12 +151,24 @@ def _eth_call_uint256(rpc_url: str, to_address: str, data: str, block_number: in
     return int(result, 16)
 
 
+def _print_progress(prefix: str, current: int, total: int, width: int = 28) -> None:
+    """Render a single-line progress bar in the terminal."""
+    if total <= 0:
+        return
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(width * ratio)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = ratio * 100.0
+    print(f"\r{prefix} [{bar}] {current}/{total} ({percent:5.1f}%)", end="", flush=True)
+
+
 def fetch_lido_wsteth_share_rate_history(
     rpc_url: str,
     start_date: str,
     end_date: str | None = None,
     sample_time_utc: str = "00:00:00",
     sleep_seconds: float = 0.0,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """Fetch historical wstETH protocol exchange rate from Ethereum RPC.
 
@@ -173,8 +185,12 @@ def fetch_lido_wsteth_share_rate_history(
     latest_block = _latest_block_number(rpc_url)
     latest_ts = int(_get_block(rpc_url, latest_block)["timestamp"], 16)
     rows = []
+    all_dates = pd.date_range(start=start, end=end, freq="D")
+    total_days = len(all_dates)
 
-    for date in pd.date_range(start=start, end=end, freq="D"):
+    for idx, date in enumerate(all_dates, start=1):
+        if show_progress:
+            _print_progress("Lido RPC", idx, total_days)
         ts = int(pd.Timestamp(f"{date.date()} {sample_time_utc}", tz="UTC").timestamp())
         if ts > latest_ts:
             continue
@@ -191,6 +207,9 @@ def fetch_lido_wsteth_share_rate_history(
         })
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
+
+    if show_progress and total_days > 0:
+        print()
 
     out = pd.DataFrame(rows)
     if out.empty:
