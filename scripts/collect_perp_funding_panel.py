@@ -34,6 +34,7 @@ OUTPUT_DIR_PROCESSED = ROOT / "data" / "processed"
 LIDO_YIELD_CANDIDATES = [
     OUTPUT_DIR_PROCESSED / "lido_staking_yield_daily.csv",
     OUTPUT_DIR_PROCESSED / "eth_yield_panel.csv",
+    OUTPUT_DIR_PROCESSED / "lido_wsteth_share_rate.csv",
 ]
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
