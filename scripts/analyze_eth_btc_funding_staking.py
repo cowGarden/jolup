@@ -24,7 +24,8 @@ from scipy import stats
 from statsmodels.regression.quantile_regression import QuantReg
 
 DEFAULT_HAC_LAGS = [1, 3, 5, 7, 14]
-LAG_HORIZONS = [1, 3, 7, 14]
+STAKE_LAG_HORIZONS = [1, 3, 7, 14, 30]
+FORWARD_HORIZONS = [1, 3, 7, 14]
 MA_WINDOWS = [7, 14, 30]
 BASE_REQUIRED = [
     "date",
@@ -40,9 +41,15 @@ OPTIONAL_CONTROLS = [
     "rv_diff",
     "oi_eth_btc",
     "oi_ratio",
+    "volume_ratio",
+    "spread_lag1",
     "basis_spread",
     "premium_spread",
+    "steth_discount",
 ]
+ROLLING_WINDOWS = [180, 365]
+REGRESSION_MIN_NOBS = 30
+
 
 
 @dataclass
@@ -61,12 +68,17 @@ def normalize_utc_daily(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True).dt.normalize()
 
 
-def save_table(df: pd.DataFrame, path: Path, title: str | None = None) -> pd.DataFrame:
+def save_table(df: pd.DataFrame, path: Path, title: str | None = None, aliases: list[Path] | None = None) -> pd.DataFrame:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
+    for alias in aliases or []:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(alias, index=False)
     if title:
         print(f"\n=== {title} ===")
     print(f"Saved: {path}")
+    for alias in aliases or []:
+        print(f"Saved alias: {alias}")
     if not df.empty:
         print(df.to_string(index=False, max_rows=20))
     else:
@@ -167,21 +179,38 @@ def run_ols_hac(y: pd.Series, X: pd.DataFrame, maxlags: int = 5, add_const: bool
     return sm.OLS(y, X_, missing="drop").fit(cov_type="HAC", cov_kwds={"maxlags": int(maxlags)})
 
 
-def extract_reg_result(res, model_name: str, key_var: str = "stake_yield", hac_lags: int | None = None, controls: list[str] | None = None) -> dict[str, object]:
-    return {
-        "model_name": model_name,
-        "nobs": int(res.nobs),
-        "r2": getattr(res, "rsquared", np.nan),
-        "adj_r2": getattr(res, "rsquared_adj", np.nan),
-        "hac_lags": hac_lags,
-        "key_var": key_var,
-        "key_coef": res.params.get(key_var, np.nan),
-        "key_se": res.bse.get(key_var, np.nan),
-        "key_t": res.tvalues.get(key_var, np.nan),
-        "key_pvalue": res.pvalues.get(key_var, np.nan),
-        "const_coef": res.params.get("const", np.nan),
-        "controls": ",".join(controls or []),
-    }
+def extract_reg_results(res, model_name: str, key_var: str = "stake_yield", hac_lags: int | None = None, controls: list[str] | None = None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for term in res.params.index:
+        rows.append({
+            "model_name": model_name,
+            "nobs": int(res.nobs),
+            "r2": getattr(res, "rsquared", np.nan),
+            "adj_r2": getattr(res, "rsquared_adj", np.nan),
+            "hac_lags": hac_lags,
+            "term": term,
+            "coefficient": res.params.get(term, np.nan),
+            "std_error": res.bse.get(term, np.nan),
+            "t_stat": res.tvalues.get(term, np.nan),
+            "pvalue": res.pvalues.get(term, np.nan),
+            "key_var": key_var,
+            "key_coef": res.params.get(key_var, np.nan),
+            "key_se": res.bse.get(key_var, np.nan),
+            "key_t": res.tvalues.get(key_var, np.nan),
+            "key_pvalue": res.pvalues.get(key_var, np.nan),
+            "const_coef": res.params.get("const", np.nan),
+            "controls": ",".join(controls or []),
+        })
+    return rows
+
+
+def term_value(table: pd.DataFrame, model_name: str, term: str, field: str, hac_lags: int = 5) -> float:
+    if table.empty or "term" not in table.columns:
+        return np.nan
+    hit = table.loc[(table["model_name"] == model_name) & (table["term"] == term) & (table["hac_lags"] == hac_lags), field]
+    if hit.empty:
+        hit = table.loc[(table["model_name"] == model_name) & (table["term"] == term), field]
+    return float(hit.iloc[0]) if not hit.empty else np.nan
 
 
 def run_model_specs(df: pd.DataFrame, specs: list[tuple[str, list[str]]], y_col: str = "spread", hac_lags: Iterable[int] = DEFAULT_HAC_LAGS) -> pd.DataFrame:
@@ -194,7 +223,7 @@ def run_model_specs(df: pd.DataFrame, specs: list[tuple[str, list[str]]], y_col:
             continue
         for lag in hac_lags:
             res = run_ols_hac(reg[y_col], reg[x_cols], maxlags=int(lag))
-            rows.append(extract_reg_result(res, model_name, key_var=x_cols[0], hac_lags=int(lag), controls=x_cols[1:]))
+            rows.extend(extract_reg_results(res, model_name, key_var=x_cols[0], hac_lags=int(lag), controls=x_cols[1:]))
     return pd.DataFrame(rows)
 
 
@@ -231,7 +260,7 @@ def run_lag_regressions(df: pd.DataFrame, exchange: str, results_dir: Path) -> p
     work = df.copy()
     controls = primary_controls(work)
     rows = []
-    for h in LAG_HORIZONS:
+    for h in STAKE_LAG_HORIZONS:
         work[f"stake_yield_l{h}"] = work["stake_yield"].shift(h)
         lagged_controls = []
         for col in controls:
@@ -250,14 +279,14 @@ def run_lag_regressions(df: pd.DataFrame, exchange: str, results_dir: Path) -> p
                 res_df["regression_type"] = name.split("_")[1]
                 rows.append(res_df)
     out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return save_table(out, results_dir / f"{exchange}_lag_regressions.csv", f"{exchange} lag regressions")
+    return save_table(out, results_dir / f"{exchange}_lagged_stake_yield_models.csv", f"{exchange} lag regressions", alias_for(exchange, ["lagged_stake_yield_models.csv"], results_dir))
 
 
 def run_forward_spread_regressions(df: pd.DataFrame, exchange: str, results_dir: Path) -> pd.DataFrame:
     work = df.copy()
     controls = primary_controls(work)
     rows = []
-    for h in LAG_HORIZONS:
+    for h in FORWARD_HORIZONS:
         y_col = f"spread_fwd{h}"
         work[y_col] = work["spread"].shift(-h)
         model = f"forward_h{h}"
@@ -267,7 +296,7 @@ def run_forward_spread_regressions(df: pd.DataFrame, exchange: str, results_dir:
             res_df["note"] = "descriptive overlapping-horizon regression; not a trading forecast"
             rows.append(res_df)
     out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return save_table(out, results_dir / f"{exchange}_forward_spread_regressions.csv", f"{exchange} forward spread regressions")
+    return save_table(out, results_dir / f"{exchange}_forward_spread_models.csv", f"{exchange} forward spread regressions", alias_for(exchange, ["forward_spread_models.csv"], results_dir))
 
 
 def run_moving_average_regressions(df: pd.DataFrame, exchange: str, results_dir: Path) -> pd.DataFrame:
@@ -286,12 +315,16 @@ def run_moving_average_regressions(df: pd.DataFrame, exchange: str, results_dir:
             ma_col = f"{col}_ma{window}"
             work[ma_col] = work[col].rolling(window, min_periods=window).mean()
             ma_controls.append(ma_col)
-        res_df = run_model_specs(work, [(f"MA{window}", [stake_col] + ma_controls)], y_col, [min(window, 14)])
+        specs = [
+            (f"MA{window}_stake_ret_rv", [stake_col] + ma_controls),
+            (f"MA{window}_ret_rv", ma_controls),
+        ]
+        res_df = run_model_specs(work, specs, y_col, [min(window, 14)])
         if not res_df.empty:
             res_df["window"] = window
             rows.append(res_df)
     out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return save_table(out, results_dir / f"{exchange}_moving_average_regressions.csv", f"{exchange} moving-average regressions")
+    return save_table(out, results_dir / f"{exchange}_moving_average_models.csv", f"{exchange} moving-average regressions", alias_for(exchange, ["moving_average_models.csv"], results_dir))
 
 
 def winsorize_series(s: pd.Series, lower: float, upper: float) -> pd.Series:
@@ -302,19 +335,25 @@ def winsorize_series(s: pd.Series, lower: float, upper: float) -> pd.Series:
 def run_winsorized_regressions(df: pd.DataFrame, exchange: str, results_dir: Path, hac_lags: list[int]) -> pd.DataFrame:
     low, high = df["spread"].quantile([0.01, 0.99])
     extreme = df.loc[(df["spread"] <= low) | (df["spread"] >= high), ["date", "spread", "eth_funding_ann", "btc_funding_ann", "stake_yield"]].copy()
-    save_table(extreme, results_dir / f"{exchange}_extreme_spread_dates.csv", f"{exchange} extreme spread dates")
+    save_table(extreme, results_dir / f"{exchange}_extreme_spread_dates.csv", f"{exchange} extreme spread dates", alias_for(exchange, ["extreme_spread_dates.csv"], results_dir))
     rows = []
     target_cols = [c for c in ["spread", "stake_yield", "ret_eth_btc", "rv_eth_btc", "rv_log_ratio", "oi_eth_btc", "oi_ratio"] if c in df.columns]
+    robustness_specs = [("stake_only", ["stake_yield"]), ("stake_ret_rv", ["stake_yield"] + primary_controls(df)), ("ret_rv", primary_controls(df))]
     for lower, upper, label in [(0.01, 0.99, "winsor_1_99"), (0.05, 0.95, "winsor_5_95")]:
         work = df.copy()
         for col in target_cols:
             work[col] = winsorize_series(work[col], lower, upper)
-        res_df = run_model_specs(work, build_main_specs(work), "spread", hac_lags)
+        res_df = run_model_specs(work, robustness_specs, "spread", hac_lags)
         if not res_df.empty:
-            res_df["winsorization"] = label
+            res_df["outlier_method"] = label
             rows.append(res_df)
+    trimmed = df.loc[~((df["spread"] <= low) | (df["spread"] >= high))].copy()
+    res_df = run_model_specs(trimmed, robustness_specs, "spread", hac_lags)
+    if not res_df.empty:
+        res_df["outlier_method"] = "drop_abs_spread_top_bottom_1pct"
+        rows.append(res_df)
     out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return save_table(out, results_dir / f"{exchange}_winsorized_regressions.csv", f"{exchange} winsorized regressions")
+    return save_table(out, results_dir / f"{exchange}_outlier_robustness.csv", f"{exchange} winsorized/outlier robustness", alias_for(exchange, ["outlier_robustness.csv"], results_dir))
 
 
 def run_robust_quantile_regressions(df: pd.DataFrame, exchange: str, results_dir: Path) -> pd.DataFrame:
@@ -325,46 +364,51 @@ def run_robust_quantile_regressions(df: pd.DataFrame, exchange: str, results_dir
         X = sm.add_constant(reg[x_cols], has_constant="add")
         try:
             rlm = sm.RLM(reg["spread"], X, M=sm.robust.norms.HuberT()).fit()
-            rows.append({"model_name": "RLM_HuberT", "quantile": np.nan, "nobs": int(rlm.nobs), "key_coef": rlm.params.get("stake_yield", np.nan), "key_se": rlm.bse.get("stake_yield", np.nan), "key_t": rlm.tvalues.get("stake_yield", np.nan), "key_pvalue": rlm.pvalues.get("stake_yield", np.nan), "controls": ",".join(x_cols[1:])})
+            for term in rlm.params.index:
+                rows.append({"model_name": "RLM_HuberT", "quantile": np.nan, "nobs": int(rlm.nobs), "term": term, "coefficient": rlm.params.get(term, np.nan), "std_error": rlm.bse.get(term, np.nan), "t_stat": rlm.tvalues.get(term, np.nan), "pvalue": rlm.pvalues.get(term, np.nan), "key_coef": rlm.params.get("stake_yield", np.nan), "key_se": rlm.bse.get("stake_yield", np.nan), "key_t": rlm.tvalues.get("stake_yield", np.nan), "key_pvalue": rlm.pvalues.get("stake_yield", np.nan), "controls": ",".join(x_cols[1:])})
         except Exception as exc:  # numerical convergence can fail on small/noisy samples
             warnings.warn(f"{exchange}: RLM failed: {exc}")
-        for q in [0.25, 0.5, 0.75]:
+        for q in [0.5]:
             try:
                 qr = QuantReg(reg["spread"], X).fit(q=q)
-                rows.append({"model_name": "QuantReg", "quantile": q, "nobs": int(qr.nobs), "key_coef": qr.params.get("stake_yield", np.nan), "key_se": qr.bse.get("stake_yield", np.nan), "key_t": qr.tvalues.get("stake_yield", np.nan), "key_pvalue": qr.pvalues.get("stake_yield", np.nan), "controls": ",".join(x_cols[1:])})
+                for term in qr.params.index:
+                    rows.append({"model_name": "QuantReg", "quantile": q, "nobs": int(qr.nobs), "term": term, "coefficient": qr.params.get(term, np.nan), "std_error": qr.bse.get(term, np.nan), "t_stat": qr.tvalues.get(term, np.nan), "pvalue": qr.pvalues.get(term, np.nan), "key_coef": qr.params.get("stake_yield", np.nan), "key_se": qr.bse.get("stake_yield", np.nan), "key_t": qr.tvalues.get("stake_yield", np.nan), "key_pvalue": qr.pvalues.get("stake_yield", np.nan), "controls": ",".join(x_cols[1:])})
             except Exception as exc:
                 warnings.warn(f"{exchange}: QuantReg q={q} failed: {exc}")
     out = pd.DataFrame(rows)
-    return save_table(out, results_dir / f"{exchange}_robust_quantile_regressions.csv", f"{exchange} robust and quantile regressions")
+    return save_table(out, results_dir / f"{exchange}_robust_regression_results.csv", f"{exchange} robust and quantile regressions", alias_for(exchange, ["robust_regression_results.csv"], results_dir))
 
 
 def run_high_low_tests(df: pd.DataFrame, exchange: str, results_dir: Path) -> pd.DataFrame:
-    reg = drop_regression_na(df, ["stake_yield", "spread"], f"{exchange}_high_low")
+    reg = drop_regression_na(df, ["stake_yield", "spread", "ret_eth_btc"], f"{exchange}_high_low")
     rows = []
     if not reg.empty:
         median = reg["stake_yield"].median()
-        high = reg.loc[reg["stake_yield"] > median, "spread"]
-        low = reg.loc[reg["stake_yield"] <= median, "spread"]
+        high_df = reg.loc[reg["stake_yield"] > median]
+        low_df = reg.loc[reg["stake_yield"] <= median]
+        high = high_df["spread"]
+        low = low_df["spread"]
         t_stat, t_p = stats.ttest_ind(high, low, equal_var=False, nan_policy="omit")
         try:
             u_stat, u_p = stats.mannwhitneyu(high, low, alternative="two-sided")
         except ValueError:
             u_stat, u_p = np.nan, np.nan
         rows.extend([
-            {"test": "median_split_low", "group": "low", "n": len(low), "mean_spread": low.mean(), "median_spread": low.median(), "difference_high_minus_low": np.nan, "stat": np.nan, "pvalue": np.nan},
-            {"test": "median_split_high", "group": "high", "n": len(high), "mean_spread": high.mean(), "median_spread": high.median(), "difference_high_minus_low": high.mean() - low.mean(), "stat": np.nan, "pvalue": np.nan},
-            {"test": "welch_t_high_minus_low", "group": "high-low", "n": len(high) + len(low), "mean_spread": np.nan, "median_spread": np.nan, "difference_high_minus_low": high.mean() - low.mean(), "stat": t_stat, "pvalue": t_p},
-            {"test": "mann_whitney_high_vs_low", "group": "high-low", "n": len(high) + len(low), "mean_spread": np.nan, "median_spread": np.nan, "difference_high_minus_low": high.mean() - low.mean(), "stat": u_stat, "pvalue": u_p},
+            {"test": "median_split_low", "group": "low", "n": len(low), "mean_spread": low.mean(), "median_spread": low.median(), "mean_ret_eth_btc": low_df["ret_eth_btc"].mean(), "difference_high_minus_low": np.nan, "stat": np.nan, "pvalue": np.nan},
+            {"test": "median_split_high", "group": "high", "n": len(high), "mean_spread": high.mean(), "median_spread": high.median(), "mean_ret_eth_btc": high_df["ret_eth_btc"].mean(), "difference_high_minus_low": high.mean() - low.mean(), "stat": np.nan, "pvalue": np.nan},
+            {"test": "welch_t_high_minus_low", "group": "high-low", "n": len(high) + len(low), "mean_spread": np.nan, "median_spread": np.nan, "mean_ret_eth_btc": np.nan, "difference_high_minus_low": high.mean() - low.mean(), "stat": t_stat, "pvalue": t_p},
+            {"test": "mann_whitney_high_vs_low", "group": "high-low", "n": len(high) + len(low), "mean_spread": np.nan, "median_spread": np.nan, "mean_ret_eth_btc": np.nan, "difference_high_minus_low": high.mean() - low.mean(), "stat": u_stat, "pvalue": u_p},
         ])
         tercile = pd.qcut(reg["stake_yield"], 3, labels=["low", "mid", "high"], duplicates="drop")
         for group, sub in reg.groupby(tercile, observed=True):
             rows.append({"test": "tercile_split", "group": str(group), "n": len(sub), "mean_spread": sub["spread"].mean(), "median_spread": sub["spread"].median(), "difference_high_minus_low": np.nan, "stat": np.nan, "pvalue": np.nan})
     out = pd.DataFrame(rows)
-    return save_table(out, results_dir / f"{exchange}_high_low_stake_tests.csv", f"{exchange} high/low staking tests")
+    return save_table(out, results_dir / f"{exchange}_high_low_staking_yield_tests.csv", f"{exchange} high/low staking tests", alias_for(exchange, ["high_low_staking_yield_tests.csv"], results_dir))
 
 
 def run_quintile_analysis(df: pd.DataFrame, exchange: str, results_dir: Path, figures_dir: Path) -> pd.DataFrame:
-    reg = drop_regression_na(df, ["stake_yield", "spread", "eth_funding_ann", "btc_funding_ann"], f"{exchange}_quintile")
+    rv = "rv_log_ratio" if "rv_log_ratio" in df.columns else "rv_eth_btc"
+    reg = drop_regression_na(df, ["stake_yield", "spread", "ret_eth_btc", rv, "eth_funding_ann", "btc_funding_ann"], f"{exchange}_quintile")
     rows = []
     if reg["stake_yield"].nunique() >= 5:
         reg = reg.copy()
@@ -377,25 +421,35 @@ def run_quintile_analysis(df: pd.DataFrame, exchange: str, results_dir: Path, fi
             median_spread=("spread", "median"),
             mean_eth_funding_ann=("eth_funding_ann", "mean"),
             mean_btc_funding_ann=("btc_funding_ann", "mean"),
+            mean_ret_eth_btc=("ret_eth_btc", "mean"),
+            mean_rv_control=(rv, "mean"),
         ).reset_index()
         rows = summary.to_dict("records")
         q1 = reg.loc[reg["quintile"].astype(str) == "1", "spread"]
         q5 = reg.loc[reg["quintile"].astype(str) == "5", "spread"]
         t_stat, t_p = stats.ttest_ind(q5, q1, equal_var=False, nan_policy="omit")
         spear = stats.spearmanr(summary["quintile"].astype(float), summary["mean_spread"], nan_policy="omit")
-        rows.append({"quintile": "Q5-Q1_test", "n": len(q5) + len(q1), "mean_stake_yield": np.nan, "mean_spread": q5.mean() - q1.mean(), "median_spread": np.nan, "mean_eth_funding_ann": np.nan, "mean_btc_funding_ann": np.nan, "welch_t": t_stat, "welch_pvalue": t_p, "spearman_rho_quintile_mean_spread": spear.statistic, "spearman_pvalue": spear.pvalue})
+        rows.append({"quintile": "Q5-Q1_test", "n": len(q5) + len(q1), "mean_stake_yield": np.nan, "mean_spread": q5.mean() - q1.mean(), "median_spread": np.nan, "mean_eth_funding_ann": np.nan, "mean_btc_funding_ann": np.nan, "mean_ret_eth_btc": np.nan, "mean_rv_control": np.nan, "welch_t": t_stat, "welch_pvalue": t_p, "spearman_rho_quintile_mean_spread": spear.statistic, "spearman_pvalue": spear.pvalue})
         fig, ax = plt.subplots(figsize=(8, 5))
         summary.plot.bar(x="quintile", y="mean_spread", ax=ax, legend=False, color="#4C78A8")
         ax.set_title(f"{exchange}: Mean ETH-BTC Funding Spread by Staking-Yield Quintile")
         ax.set_xlabel("Staking-yield quintile")
         ax.set_ylabel("Mean annualized spread (decimal)")
         fig.tight_layout()
-        fig.savefig(figures_dir / f"{exchange}_quintile_mean_spread.png", dpi=160)
+        save_figure_with_aliases(fig, figures_dir / f"{exchange}_quintile_mean_spread.png", figure_alias_for(exchange, ["quintile_mean_spread.png"], figures_dir))
+        plt.close(fig)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        summary.plot.bar(x="quintile", y="mean_ret_eth_btc", ax=ax, legend=False, color="#F58518")
+        ax.set_title(f"{exchange}: Mean ETH/BTC Return by Staking-Yield Quintile")
+        ax.set_xlabel("Staking-yield quintile")
+        ax.set_ylabel("Mean ETH/BTC return")
+        fig.tight_layout()
+        save_figure_with_aliases(fig, figures_dir / f"{exchange}_quintile_mean_ret_eth_btc.png", figure_alias_for(exchange, ["quintile_mean_ret_eth_btc.png"], figures_dir))
         plt.close(fig)
     else:
         print(f"[WARN] {exchange}: not enough unique staking-yield values for quintiles")
     out = pd.DataFrame(rows)
-    return save_table(out, results_dir / f"{exchange}_quintile_spread_by_stake_yield.csv", f"{exchange} quintile analysis")
+    return save_table(out, results_dir / f"{exchange}_quintile_analysis_stake_yield.csv", f"{exchange} quintile analysis", alias_for(exchange, ["quintile_analysis_stake_yield.csv"], results_dir))
 
 
 def run_carry_gap_analysis(df: pd.DataFrame, exchange: str, results_dir: Path, figures_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -409,11 +463,18 @@ def run_carry_gap_analysis(df: pd.DataFrame, exchange: str, results_dir: Path, f
     t_stat, two_sided_p = stats.ttest_1samp(cg, 0, nan_policy="omit") if len(cg) else (np.nan, np.nan)
     one_sided_p = two_sided_p / 2 if t_stat > 0 else 1 - two_sided_p / 2
     desc = cg.describe()
+    cg_ret = work[["carry_gap", "ret_eth_btc"]].dropna()
+    pos_ret = cg_ret.loc[cg_ret["carry_gap"] > 0, "ret_eth_btc"]
+    neg_ret = cg_ret.loc[cg_ret["carry_gap"] <= 0, "ret_eth_btc"]
+    ret_t, ret_p = stats.ttest_ind(pos_ret, neg_ret, equal_var=False, nan_policy="omit") if len(pos_ret) and len(neg_ret) else (np.nan, np.nan)
     summary = pd.DataFrame([{
         "n": int(desc.get("count", 0)), "mean": desc.get("mean", np.nan), "std": desc.get("std", np.nan),
         "min": desc.get("min", np.nan), "p25": desc.get("25%", np.nan), "median": desc.get("50%", np.nan),
         "p75": desc.get("75%", np.nan), "max": desc.get("max", np.nan), "positive_ratio": float((cg > 0).mean()) if len(cg) else np.nan,
         "one_sample_t_mean_gt_0": t_stat, "one_sided_pvalue_mean_gt_0": one_sided_p,
+        "corr_carry_gap_ret_eth_btc": cg_ret["carry_gap"].corr(cg_ret["ret_eth_btc"]) if len(cg_ret) else np.nan,
+        "mean_ret_when_carry_gap_positive": pos_ret.mean(), "mean_ret_when_carry_gap_nonpositive": neg_ret.mean(),
+        "ret_diff_positive_minus_nonpositive": pos_ret.mean() - neg_ret.mean(), "ret_diff_welch_t": ret_t, "ret_diff_welch_pvalue": ret_p,
         "interpretation_note": "carry_gap is not a realized strategy return; fees, slippage, LST depeg, custody/exchange, margin and liquidation risks are excluded",
     }])
     rows = []
@@ -434,11 +495,11 @@ def run_carry_gap_analysis(df: pd.DataFrame, exchange: str, results_dir: Path, f
     ax.set_ylabel("Annualized decimal")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(figures_dir / f"{exchange}_carry_gap_timeseries.png", dpi=160)
+    save_figure_with_aliases(fig, figures_dir / f"{exchange}_carry_gap_timeseries.png", figure_alias_for(exchange, ["carry_gap_timeseries.png"], figures_dir))
     plt.close(fig)
     return (
-        save_table(summary, results_dir / f"{exchange}_carry_gap_summary.csv", f"{exchange} carry gap summary"),
-        save_table(meanrev, results_dir / f"{exchange}_carry_gap_mean_reversion.csv", f"{exchange} carry gap mean reversion"),
+        save_table(summary, results_dir / f"{exchange}_carry_gap_summary.csv", f"{exchange} carry gap summary", alias_for(exchange, ["carry_gap_summary.csv"], results_dir)),
+        save_table(meanrev, results_dir / f"{exchange}_carry_gap_mean_reversion.csv", f"{exchange} carry gap mean reversion", alias_for(exchange, ["carry_gap_mean_reversion.csv"], results_dir)),
     )
 
 
@@ -522,6 +583,194 @@ def make_core_figures(df: pd.DataFrame, exchange: str, figures_dir: Path) -> Non
     plt.close(fig)
 
 
+
+def alias_for(exchange: str, aliases: list[str], results_dir: Path) -> list[Path]:
+    """Write thesis-requested unprefixed filenames for the primary exchange only."""
+    return [results_dir / name for name in aliases] if exchange == "binance" else []
+
+
+def figure_alias_for(exchange: str, aliases: list[str], figures_dir: Path) -> list[Path]:
+    return [figures_dir / name for name in aliases] if exchange == "binance" else []
+
+
+def save_figure_with_aliases(fig, path: Path, aliases: list[Path] | None = None, dpi: int = 160) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi)
+    for alias in aliases or []:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(alias, dpi=dpi)
+
+
+def run_data_audit(df: pd.DataFrame, exchange: str, results_dir: Path, figures_dir: Path) -> pd.DataFrame:
+    work = df.sort_values("date").copy()
+    year_counts = work.groupby(work["date"].dt.year).size().rename("nobs").reset_index().rename(columns={"date": "year"})
+    year_counts["exchange"] = exchange
+    sy = work["stake_yield"].dropna()
+    same_run = work["stake_yield"].eq(work["stake_yield"].shift()).astype(int)
+    run_id = same_run.eq(0).cumsum()
+    runs = work.groupby(run_id).agg(start_date=("date", "min"), end_date=("date", "max"), value=("stake_yield", "first"), length=("stake_yield", "size"))
+    long_runs = runs.loc[runs["length"] >= 7].copy()
+    audit = pd.DataFrame([{
+        "exchange": exchange,
+        "start_date": work["date"].min(),
+        "end_date": work["date"].max(),
+        "nobs": len(work),
+        "duplicate_dates": int(work["date"].duplicated().sum()),
+        "missing_dates": int(len(pd.date_range(work["date"].min(), work["date"].max(), freq="D", tz="UTC").difference(pd.DatetimeIndex(work["date"])))),
+        "stake_yield_count": int(sy.count()),
+        "stake_yield_mean": sy.mean(),
+        "stake_yield_std": sy.std(),
+        "stake_yield_min": sy.min(),
+        "stake_yield_median": sy.median(),
+        "stake_yield_max": sy.max(),
+        "stake_yield_unique": int(sy.nunique()),
+        "stake_yield_ge7day_same_value_runs": int(len(long_runs)),
+        "stake_yield_max_same_value_run": int(runs["length"].max()) if not runs.empty else 0,
+    }])
+    save_table(year_counts, results_dir / f"{exchange}_yearly_observation_counts.csv")
+    save_table(long_runs.reset_index(drop=True).head(200), results_dir / f"{exchange}_stake_yield_same_value_runs.csv")
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(work["date"], work["stake_yield"], color="#F58518")
+    ax.set_title(f"{exchange}: Staking Yield Time Series")
+    ax.set_ylabel("Decimal APR")
+    fig.tight_layout()
+    save_figure_with_aliases(fig, figures_dir / f"{exchange}_stake_yield_timeseries.png", figure_alias_for(exchange, ["stake_yield_timeseries.png"], figures_dir))
+    plt.close(fig)
+    return save_table(audit, results_dir / f"{exchange}_data_audit_summary.csv")
+
+
+def baseline_specs() -> list[tuple[str, list[str]]]:
+    return [
+        ("Model_A_stake_yield", ["stake_yield"]),
+        ("Model_B_stake_ret_rv", ["stake_yield", "ret_eth_btc", "rv_eth_btc"]),
+        ("Model_C_ret_only", ["ret_eth_btc"]),
+        ("Model_D_ret_rv", ["ret_eth_btc", "rv_eth_btc"]),
+        ("Model_E_stake_ret", ["stake_yield", "ret_eth_btc"]),
+    ]
+
+
+def run_requested_baseline_models(df: pd.DataFrame, exchange: str, results_dir: Path, hac_lags: list[int]) -> pd.DataFrame:
+    specs = [(name, cols) for name, cols in baseline_specs() if all(c in df.columns for c in cols)]
+    out = run_model_specs(df, specs, "spread", hac_lags)
+    return save_table(out, results_dir / f"{exchange}_full_sample_baseline_models.csv", f"{exchange} requested full-sample baseline models", alias_for(exchange, ["full_sample_baseline_models.csv"], results_dir))
+
+
+def run_period_regressions(df: pd.DataFrame, exchange: str, results_dir: Path, period: str) -> pd.DataFrame:
+    work = df.copy()
+    if period == "year":
+        work["period"] = work["date"].dt.year.astype(str)
+        filename = f"{exchange}_subsample_yearly_regressions.csv"
+        aliases = ["subsample_yearly_regressions.csv"]
+    else:
+        half = np.where(work["date"].dt.month <= 6, "H1", "H2")
+        work["period"] = work["date"].dt.year.astype(str) + half
+        filename = f"{exchange}_subsample_halfyear_regressions.csv"
+        aliases = ["subsample_halfyear_regressions.csv"]
+    specs = [("stake_only", ["stake_yield"]), ("stake_ret_rv", ["stake_yield"] + primary_controls(work)), ("ret_rv", primary_controls(work))]
+    rows = []
+    for label, sub in work.groupby("period", sort=True):
+        for model_name, x_cols in specs:
+            if not all(c in sub.columns for c in x_cols):
+                continue
+            reg = drop_regression_na(sub, ["spread"] + x_cols, f"{exchange}_{period}_{label}_{model_name}")
+            if len(reg) < max(REGRESSION_MIN_NOBS, len(x_cols) + 3):
+                continue
+            res = run_ols_hac(reg["spread"], reg[x_cols], maxlags=5)
+            for row in extract_reg_results(res, model_name, x_cols[0], 5, x_cols[1:]):
+                row[period] = label
+                row["period"] = label
+                rows.append(row)
+    out = pd.DataFrame(rows)
+    return save_table(out, results_dir / filename, f"{exchange} {period} subsample regressions", alias_for(exchange, aliases, results_dir))
+
+
+def rolling_regression(df: pd.DataFrame, exchange: str, results_dir: Path, figures_dir: Path, window: int) -> pd.DataFrame:
+    work = df.sort_values("date").reset_index(drop=True).copy()
+    x_cols = ["stake_yield"] + primary_controls(work)
+    rows = []
+    for end in range(window - 1, len(work)):
+        sub = work.iloc[end - window + 1:end + 1]
+        reg = sub[["date", "spread"] + x_cols].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(reg) < max(REGRESSION_MIN_NOBS, len(x_cols) + 3):
+            continue
+        res = run_ols_hac(reg["spread"], reg[x_cols], maxlags=5)
+        rows.append({
+            "start_date": reg["date"].min(), "end_date": reg["date"].max(), "nobs": int(res.nobs), "r2": res.rsquared,
+            "stake_yield_coef": res.params.get("stake_yield", np.nan), "stake_yield_se": res.bse.get("stake_yield", np.nan), "stake_yield_t": res.tvalues.get("stake_yield", np.nan), "stake_yield_pvalue": res.pvalues.get("stake_yield", np.nan),
+            "ret_eth_btc_coef": res.params.get("ret_eth_btc", np.nan), "ret_eth_btc_se": res.bse.get("ret_eth_btc", np.nan), "ret_eth_btc_t": res.tvalues.get("ret_eth_btc", np.nan), "ret_eth_btc_pvalue": res.pvalues.get("ret_eth_btc", np.nan),
+        })
+    out = pd.DataFrame(rows)
+    save_table(out, results_dir / f"{exchange}_rolling_{window}d_coefficients.csv", f"{exchange} rolling {window}d coefficients", alias_for(exchange, [f"rolling_{window}d_coefficients.csv"], results_dir))
+    return out
+
+
+def plot_rolling_coefficients(rolls: dict[int, pd.DataFrame], exchange: str, figures_dir: Path, term: str) -> None:
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for window, table in rolls.items():
+        if table.empty:
+            continue
+        coef_col = f"{term}_coef"
+        se_col = f"{term}_se"
+        dates = pd.to_datetime(table["end_date"])
+        ax.plot(dates, table[coef_col], label=f"{window}d")
+        if se_col in table:
+            ax.fill_between(dates, table[coef_col] - 1.96 * table[se_col], table[coef_col] + 1.96 * table[se_col], alpha=0.12)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_title(f"{exchange}: Rolling {term} coefficient")
+    ax.legend()
+    fig.tight_layout()
+    alias_name = "rolling_stake_yield_coef.png" if term == "stake_yield" else "rolling_ret_eth_btc_coef.png"
+    save_figure_with_aliases(fig, figures_dir / f"{exchange}_{alias_name}", figure_alias_for(exchange, [alias_name], figures_dir))
+    plt.close(fig)
+
+
+def add_regime_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    work = df.sort_values("date").copy()
+    rv = "rv_log_ratio" if "rv_log_ratio" in work.columns else "rv_eth_btc"
+    work["momentum_7d"] = work["ret_eth_btc"].rolling(7, min_periods=5).sum()
+    work["high_momentum"] = (work["momentum_7d"] > work["momentum_7d"].median()).astype(int)
+    work["high_abs_spread"] = (work["spread"].abs() > work["spread"].abs().median()).astype(int)
+    work["high_volatility"] = (work[rv] > work[rv].median()).astype(int)
+    work["momentum_30d"] = work["ret_eth_btc"].rolling(30, min_periods=20).sum()
+    work["bull"] = (work["momentum_30d"] > work["momentum_30d"].median()).astype(int)
+    return work, rv
+
+
+def run_regime_analysis(df: pd.DataFrame, exchange: str, results_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    work, rv = add_regime_columns(df)
+    regimes = ["high_momentum", "high_abs_spread", "high_volatility", "bull"]
+    specs = [("stake_only", ["stake_yield"]), ("stake_ret_rv", ["stake_yield", "ret_eth_btc", rv]), ("ret_rv", ["ret_eth_btc", rv])]
+    rows = []
+    for regime in regimes:
+        for value, sub in work.dropna(subset=[regime]).groupby(regime):
+            for model_name, x_cols in specs:
+                reg = drop_regression_na(sub, ["spread"] + x_cols, f"{exchange}_{regime}_{value}_{model_name}")
+                if len(reg) < max(REGRESSION_MIN_NOBS, len(x_cols) + 3):
+                    continue
+                res = run_ols_hac(reg["spread"], reg[x_cols], 5)
+                for row in extract_reg_results(res, model_name, x_cols[0], 5, x_cols[1:]):
+                    row.update({"regime": regime, "regime_value": int(value), "rv_control": rv})
+                    rows.append(row)
+    reg_out = pd.DataFrame(rows)
+    save_table(reg_out, results_dir / f"{exchange}_regime_regressions.csv", f"{exchange} regime regressions", alias_for(exchange, ["regime_regressions.csv"], results_dir))
+
+    int_rows = []
+    for regime in regimes:
+        temp = work.copy()
+        xint = f"stake_yield_x_{regime}"
+        temp[xint] = temp["stake_yield"] * temp[regime]
+        x_cols = ["stake_yield", regime, xint, "ret_eth_btc", rv]
+        reg = drop_regression_na(temp, ["spread"] + x_cols, f"{exchange}_{regime}_interaction")
+        if len(reg) < max(REGRESSION_MIN_NOBS, len(x_cols) + 3):
+            continue
+        res = run_ols_hac(reg["spread"], reg[x_cols], 5)
+        for row in extract_reg_results(res, f"interaction_{regime}", "stake_yield", 5, x_cols[1:]):
+            row.update({"regime": regime, "interaction_term": xint, "rv_control": rv})
+            int_rows.append(row)
+    int_out = pd.DataFrame(int_rows)
+    save_table(int_out, results_dir / f"{exchange}_regime_interaction_models.csv", f"{exchange} regime interaction models", alias_for(exchange, ["regime_interaction_models.csv"], results_dir))
+    return reg_out, int_out
+
 def run_pooled_exchange_comparison(exchange_dfs: dict[str, pd.DataFrame], results_dir: Path) -> pd.DataFrame:
     if not {"binance", "bybit"}.issubset(exchange_dfs):
         print("[WARN] Need both Binance and Bybit for pooled comparison; skipping.")
@@ -578,7 +827,39 @@ def print_console_summary(outputs: dict[str, ExchangeOutputs], pooled: pd.DataFr
             print(f"5. High staking yield group lower spread: {bool(diff < 0)} (high-low={diff:.6g})")
         if not carry.empty:
             print(f"6. Carry gap positive on average: {bool(carry.iloc[0]['mean'] > 0)} (mean={carry.iloc[0]['mean']:.6g}, one-sided p={carry.iloc[0]['one_sided_pvalue_mean_gt_0']:.4g})")
-        print(f"7. Column availability: OI={any(c in frames.get('source_columns', []) for c in ['oi_eth_btc','oi_ratio'])}, basis/premium={any(c in frames.get('source_columns', []) for c in ['basis_spread','premium_spread'])}")
+        baseline = frames.get("baseline", pd.DataFrame())
+        yearly = frames.get("yearly", pd.DataFrame())
+        halfyear = frames.get("halfyear", pd.DataFrame())
+        rolling_180 = frames.get("rolling_180", pd.DataFrame())
+        rolling_365 = frames.get("rolling_365", pd.DataFrame())
+        stake_p = term_value(baseline, "Model_B_stake_ret_rv", "stake_yield", "pvalue")
+        stake_coef = term_value(baseline, "Model_B_stake_ret_rv", "stake_yield", "coefficient")
+        ret_p = term_value(baseline, "Model_B_stake_ret_rv", "ret_eth_btc", "pvalue")
+        ret_coef = term_value(baseline, "Model_B_stake_ret_rv", "ret_eth_btc", "coefficient")
+        sig_periods = pd.concat([yearly, halfyear], ignore_index=True) if not yearly.empty or not halfyear.empty else pd.DataFrame()
+        sig_stake_periods = sig_periods.loc[(sig_periods.get("term", pd.Series(dtype=object)) == "stake_yield") & (sig_periods.get("pvalue", pd.Series(dtype=float)) < 0.05), "period"].astype(str).unique().tolist() if not sig_periods.empty else []
+        roll_tables = [t for t in [rolling_180, rolling_365] if not t.empty and "stake_yield_pvalue" in t]
+        roll_sig_share = np.nan if not roll_tables else float(np.mean([t["stake_yield_pvalue"].lt(0.05).mean() for t in roll_tables]))
+        ma_sig = False if ma.empty else bool((((ma.get("term") == "stake_yield") | (ma.get("term", pd.Series(dtype=object)).astype(str).str.startswith("stake_yield_ma"))) & (ma.get("pvalue", pd.Series(dtype=float)) < 0.05)).any())
+        highlow_p = highlow.loc[highlow["test"] == "welch_t_high_minus_low", "pvalue"].iloc[0] if not highlow.empty and (highlow["test"] == "welch_t_high_minus_low").any() else np.nan
+        conclusion = "D: 어떤 변수도 안정적으로 설명하지 못한다."
+        if pd.notna(ret_p) and ret_p < 0.05 and (pd.isna(stake_p) or stake_p >= 0.05):
+            conclusion = "C: 전체적으로 staking yield보다는 ETH/BTC 상대수익률, 즉 leverage demand/momentum이 funding spread를 더 잘 설명한다."
+        elif pd.notna(stake_p) and stake_p < 0.05 and sig_stake_periods:
+            conclusion = "B: staking yield 효과는 특정 regime/부분표본에서만 나타난다."
+        elif pd.notna(stake_p) and stake_p < 0.05:
+            conclusion = "A: ETH staking yield가 funding spread에 안정적으로 반영된다."
+        print("\n논문 방향 자동 요약")
+        print(f"1. 전체 샘플 stake_yield 유의성(Model B): coef={stake_coef:.6g}, p={stake_p:.4g}, significant={bool(pd.notna(stake_p) and stake_p < 0.05)}")
+        print(f"2. 전체 샘플 ret_eth_btc 유의성(Model B): coef={ret_coef:.6g}, p={ret_p:.4g}, significant={bool(pd.notna(ret_p) and ret_p < 0.05)}")
+        print(f"3. 연도/반기별 stake_yield 유의 구간(p<0.05): {sig_stake_periods or 'none'}")
+        print(f"4. Rolling stake_yield 유의 window 평균 비중: {roll_sig_share if pd.notna(roll_sig_share) else 'n/a'}")
+        print(f"5. Moving-average에서 stake_yield 유의성 회복: {ma_sig}")
+        print(f"6. High/low staking yield spread 차이 Welch p-value: {highlow_p if pd.notna(highlow_p) else 'n/a'}")
+        if not carry.empty:
+            print(f"7. Carry gap 평균 양수 여부: {bool(carry.iloc[0]['mean'] > 0)} (mean={carry.iloc[0]['mean']:.6g})")
+        print(f"8. 더 타당한 결론: {conclusion}")
+        print(f"9. Column availability: OI={any(c in frames.get('source_columns', []) for c in ['oi_eth_btc','oi_ratio'])}, basis/premium={any(c in frames.get('source_columns', []) for c in ['basis_spread','premium_spread'])}")
         for msg in output.warnings:
             print(f"   [DATA WARN] {msg}")
     if {"binance", "bybit"}.issubset(by_exchange_signs):
@@ -596,7 +877,19 @@ def run_exchange(exchange: str, raw_df: pd.DataFrame, results_dir: Path, figures
     df, warn = validate_master_df(raw_df, exchange)
     make_core_figures(df, exchange, figures_dir)
     frames: dict[str, pd.DataFrame] = {"source_columns": list(df.columns)}  # type: ignore[dict-item]
+    frames["data_audit"] = run_data_audit(df, exchange, results_dir, figures_dir)
+    frames["baseline"] = run_requested_baseline_models(df, exchange, results_dir, hac_lags)
     frames["main"] = run_main_regressions(df, exchange, results_dir, hac_lags)
+    frames["yearly"] = run_period_regressions(df, exchange, results_dir, "year")
+    frames["halfyear"] = run_period_regressions(df, exchange, results_dir, "halfyear")
+    rolls = {window: rolling_regression(df, exchange, results_dir, figures_dir, window) for window in ROLLING_WINDOWS}
+    frames["rolling_180"] = rolls.get(180, pd.DataFrame())
+    frames["rolling_365"] = rolls.get(365, pd.DataFrame())
+    plot_rolling_coefficients(rolls, exchange, figures_dir, "stake_yield")
+    plot_rolling_coefficients(rolls, exchange, figures_dir, "ret_eth_btc")
+    regime, regime_interaction = run_regime_analysis(df, exchange, results_dir)
+    frames["regime"] = regime
+    frames["regime_interaction"] = regime_interaction
     frames["lag"] = run_lag_regressions(df, exchange, results_dir)
     frames["forward"] = run_forward_spread_regressions(df, exchange, results_dir)
     frames["moving_average"] = run_moving_average_regressions(df, exchange, results_dir)
