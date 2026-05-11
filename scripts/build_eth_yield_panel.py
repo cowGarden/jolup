@@ -15,7 +15,9 @@ from common.config import RAW_DATA_DIR, PROCESSED_DATA_DIR
 from common.yield_pipeline import (
     build_eth_yield_panel,
     build_assumed_eth_yield_history,
+    fetch_wsteth_contract_rate_history,
     fetch_lido_wsteth_share_rate_history,
+    print_wsteth_rate_summary,
     fetch_lido_current_apr,
     fetch_stakingrewards_eth_reward_rate_history,
     save_yield_csv,
@@ -25,22 +27,26 @@ from common.yield_pipeline import (
 
 def parse_args():
     p = argparse.ArgumentParser(description="Build ETH yield panel from CF ETH_SRR or supported proxy sources")
-    p.add_argument("--yield-source", default="manual", choices=["manual", "assumed", "lido-rpc", "stakingrewards", "lido-current"],
-                   help="manual expects --cf-srr-csv to exist; assumed/lido-rpc/stakingrewards/lido-current create it first")
+    p.add_argument("--yield-source", default="manual", choices=["manual", "assumed", "wsteth-rpc", "lido-rpc", "stakingrewards", "lido-current"],
+                   help="manual expects --cf-srr-csv to exist; assumed/wsteth-rpc/lido-rpc/stakingrewards/lido-current create it first")
     p.add_argument("--cf-srr-csv", default=str(RAW_DATA_DIR / "cf_eth_srr.csv"),
                    help="Input/output normalized yield CSV. For manual CF data, provide date,eth_srr columns.")
     p.add_argument("--start-date", default="2023-11-27", help="Start date for API history or assumed series")
     p.add_argument("--end-date", default=None, help="End date for assumed series; defaults to today")
     p.add_argument("--assumed-apr", type=float, default=3.0,
-                   help="Constant APR for --yield-source assumed. Accepts 3.0 or 0.03 for 3%.")
+                   help="Constant APR for --yield-source assumed. Accepts 3.0 or 0.03 for 3%%.")
     p.add_argument("--ethereum-rpc-url", default=os.getenv("ETHEREUM_RPC_URL"),
-                   help="Ethereum mainnet JSON-RPC URL for --yield-source lido-rpc")
+                   help="Ethereum mainnet JSON-RPC URL for --yield-source wsteth-rpc/lido-rpc")
     p.add_argument("--sample-time-utc", default="00:00:00",
-                   help="UTC time sampled each day for lido-rpc share-rate observations")
+                   help="UTC time sampled each day for wstETH/lido RPC observations")
     p.add_argument("--rpc-sleep-seconds", type=float, default=0.0,
                    help="Optional delay between daily RPC calls to avoid rate limits")
+    p.add_argument("--eth-blocks-csv", default=None,
+                   help="Optional date,block_number CSV to avoid RPC block lookup")
+    p.add_argument("--lst-rate-cache-dir", default=str(ROOT / "data" / "cache" / "lst_rates"),
+                   help="Cache directory for Ethereum daily blocks and wstETH contract rates")
     p.add_argument("--no-progress", action="store_true",
-                   help="Disable lido-rpc progress bar output")
+                   help="Disable RPC progress bar output")
     p.add_argument("--stakingrewards-api-key", default=os.getenv("STAKING_REWARDS_API_KEY"),
                    help="Staking Rewards API key; defaults to STAKING_REWARDS_API_KEY env var")
     p.add_argument("--history-limit", type=int, default=500,
@@ -69,6 +75,31 @@ def ensure_yield_input(args) -> Path:
             f"Saved assumed constant ETH staking APR series: {cf_srr_csv} "
             f"({len(df)} rows, APR={df['stake_yield'].iloc[0]:.4%})"
         )
+        return cf_srr_csv
+
+    if args.yield_source == "wsteth-rpc":
+        if not args.ethereum_rpc_url:
+            raise ValueError(
+                "--yield-source wsteth-rpc requires --ethereum-rpc-url "
+                "or ETHEREUM_RPC_URL environment variable."
+            )
+        cache_dir = Path(args.lst_rate_cache_dir)
+        df = fetch_wsteth_contract_rate_history(
+            rpc_url=args.ethereum_rpc_url,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            sample_time_utc=args.sample_time_utc,
+            eth_blocks_csv=args.eth_blocks_csv,
+            block_cache_csv=cache_dir / "ethereum_daily_blocks.csv",
+            rate_cache_csv=cache_dir / "wsteth_rate_history.csv",
+            sleep_seconds=args.rpc_sleep_seconds,
+            show_progress=not args.no_progress,
+        )
+        if df.empty:
+            raise RuntimeError("wstETH contract exchange-rate collection returned no rows.")
+        save_yield_csv(df, cf_srr_csv)
+        print_wsteth_rate_summary(df)
+        print(f"Saved wstETH contract-rate yield history: {cf_srr_csv} ({len(df)} rows)")
         return cf_srr_csv
 
     if args.yield_source == "lido-rpc":
