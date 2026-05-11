@@ -60,7 +60,15 @@ EXOGENOUS_SPECS = {
     "alt-yield": ("exogenous_alt_yield_daily.csv", ["alt_yield_proxy"]),
     "queue": ("exogenous_queue_daily.csv", ["staking_queue_wait_days"]),
 }
+ETH_YIELD_PRIORITY = [
+    "wsteth_implied_yield_7d",
+    "wsteth_implied_yield_30d",
+    "eth_native_yield",
+    "stake_yield",
+    "wsteth_defillama_apy",
+]
 STAKE_YIELD_CANDIDATES = [
+    "funding_yield_panel.csv",
     "eth_yield_panel.csv",
     "lido_eth_yield_panel.csv",
     "lido_yield_panel.csv",
@@ -184,14 +192,18 @@ def load_stake_yield_series(input_dir: Path, explicit_path: Path | None = None) 
         df = pd.read_csv(path)
         if "stake_yield" not in df.columns and "annualized_apr_decimal" in df.columns:
             df["stake_yield"] = df["annualized_apr_decimal"]
-        if not {"date", "stake_yield"}.issubset(df.columns):
-            print(f"[WARN] {path} has no (date, stake_yield); skipping.")
+        selected = next((col for col in ETH_YIELD_PRIORITY if col in df.columns and pd.to_numeric(df[col], errors="coerce").notna().any()), None)
+        if selected is None or "date" not in df.columns:
+            print(f"[WARN] {path} has no date plus supported ETH yield candidate {ETH_YIELD_PRIORITY}; skipping.")
             continue
-        out = df[["date", "stake_yield"]].copy()
+        if selected == "wsteth_defillama_apy":
+            print("[WARN] Using wsteth_defillama_apy only as robustness fallback; it is not contract implied yield.")
+        out = df[["date", selected]].copy().rename(columns={selected: "stake_yield"})
+        out["stake_yield_source"] = selected
         out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.date.astype(str)
         out["stake_yield"] = pd.to_numeric(out["stake_yield"], errors="coerce")
         out = out.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
-        print(f"[INFO] Loaded stake_yield fallback: {path} ({len(out):,} rows)")
+        print(f"[INFO] Loaded stake_yield fallback from {selected}: {path} ({len(out):,} rows)")
         return out
     print("[WARN] No fallback stake_yield CSV found in input-dir.")
     return None

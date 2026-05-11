@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import time
+import warnings
 
 from Crypto.Hash import keccak
+import numpy as np
 import pandas as pd
 import requests
 
@@ -12,7 +14,18 @@ STAKING_REWARDS_GRAPHQL_URL = "https://api.stakingrewards.com/public/query"
 LIDO_LAST_APR_URL = "https://eth-api.lido.fi/v1/protocol/steth/apr/last"
 LIDO_SMA_APR_URL = "https://eth-api.lido.fi/v1/protocol/steth/apr/sma"
 WSTETH_MAINNET_ADDRESS = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+WSTETH_RATE_SOURCE = "ethereum_rpc_wsteth_contract"
+WSTETH_ABI = [
+    {
+        "name": "getStETHByWstETH",
+        "outputs": [{"type": "uint256"}],
+        "inputs": [{"name": "_wstETHAmount", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
 SECONDS_PER_DAY = 24 * 60 * 60
+ONE_WSTETH_WEI = 10**18
 
 
 def _normalize_yield_value(series: pd.Series) -> pd.Series:
@@ -24,6 +37,94 @@ def _normalize_yield_value(series: pd.Series) -> pd.Series:
         values = values / 100.0
     return values
 
+
+
+def _normalize_daily_date(series: pd.Series) -> pd.Series:
+    """Parse date-like values to naive normalized daily timestamps."""
+    if pd.api.types.is_numeric_dtype(series):
+        numeric = pd.to_numeric(series, errors="coerce")
+        unit = "ms" if numeric.dropna().abs().median() > 1e11 else "s"
+        parsed = pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce")
+    else:
+        parsed = pd.to_datetime(series, utc=True, errors="coerce", format="mixed")
+        if parsed.isna().any():
+            numeric = pd.to_numeric(series, errors="coerce")
+            if numeric.notna().any():
+                unit = "ms" if numeric.dropna().abs().median() > 1e11 else "s"
+                parsed = parsed.fillna(pd.to_datetime(numeric, unit=unit, utc=True, errors="coerce"))
+    return parsed.dt.tz_convert(None).dt.normalize()
+
+
+def add_implied_yields_from_rate(
+    df: pd.DataFrame,
+    rate_col: str = "wsteth_rate",
+    windows: tuple[int, ...] = (1, 7, 30),
+    prefix: str = "wsteth_implied_yield",
+) -> pd.DataFrame:
+    """Add log-change annualized implied yields from a protocol exchange-rate column.
+
+    Yields are decimal annualized units. For example, 0.035 means 3.5% annualized.
+    """
+    if rate_col not in df.columns:
+        raise KeyError(f"Missing rate column: {rate_col}")
+    out = df.copy().sort_values("date") if "date" in df.columns else df.copy()
+    rate = pd.to_numeric(out[rate_col], errors="coerce")
+    log_rate = pd.Series(np.nan, index=out.index, dtype="float64")
+    valid = rate > 0
+    log_rate.loc[valid] = np.log(rate.loc[valid])
+    for window in windows:
+        out[f"{prefix}_{window}d"] = (365.0 / float(window)) * (log_rate - log_rate.shift(window))
+    return out
+
+
+def validate_wsteth_rate_shape(df: pd.DataFrame, rate_col: str = "wsteth_rate") -> dict:
+    """Return diagnostics and warn if a rate CSV looks like a market ratio, not contract rate."""
+    if rate_col not in df.columns:
+        raise KeyError(f"Missing rate column: {rate_col}")
+    rates = pd.to_numeric(df[rate_col], errors="coerce").dropna()
+    diagnostics = {
+        "obs": int(len(rates)),
+        "start": float(rates.iloc[0]) if len(rates) else float("nan"),
+        "end": float(rates.iloc[-1]) if len(rates) else float("nan"),
+        "min": float(rates.min()) if len(rates) else float("nan"),
+        "max": float(rates.max()) if len(rates) else float("nan"),
+        "negative_steps": int((rates.diff().dropna() < 0).sum()),
+        "total_log_drift": float(np.log(rates.iloc[-1] / rates.iloc[0])) if len(rates) >= 2 and rates.iloc[0] > 0 and rates.iloc[-1] > 0 else float("nan"),
+    }
+    if len(rates) >= 5:
+        near_one = 0.95 <= diagnostics["min"] <= diagnostics["max"] <= 1.08
+        low_or_negative_drift = diagnostics["total_log_drift"] < 0.01
+        many_down_moves = diagnostics["negative_steps"] > max(2, int(0.05 * (len(rates) - 1)))
+        if near_one and (low_or_negative_drift or many_down_moves):
+            warnings.warn(
+                "wstETH rate CSV looks like a market price ratio rather than a contract exchange rate: "
+                "values hover near 1, lack clear upward drift, or frequently move down. "
+                "Do not use market ratios as wsteth_implied_yield_*.",
+                UserWarning,
+                stacklevel=2,
+            )
+    return diagnostics
+
+
+def load_wsteth_rate_csv(csv_path: str | Path) -> pd.DataFrame:
+    """Load a user-supplied wstETH contract exchange-rate CSV and add implied yields."""
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+    cols = {c.lower().strip(): c for c in df.columns}
+    date_col = cols.get("date") or cols.get("timestamp") or cols.get("day")
+    rate_col = cols.get("wsteth_rate") or cols.get("share_rate") or cols.get("exchange_rate") or cols.get("steth_per_wsteth")
+    block_col = cols.get("wsteth_rate_block") or cols.get("block_number") or cols.get("block")
+    if not date_col or not rate_col:
+        raise ValueError("wstETH rate CSV must contain date plus wsteth_rate/share_rate/exchange_rate.")
+    out = pd.DataFrame({
+        "date": _normalize_daily_date(df[date_col]),
+        "wsteth_rate": pd.to_numeric(df[rate_col], errors="coerce"),
+    }).dropna(subset=["date", "wsteth_rate"])
+    out["wsteth_rate_block"] = pd.to_numeric(df[block_col], errors="coerce") if block_col else pd.NA
+    out["wsteth_rate_source"] = "user_csv_wsteth_contract_rate"
+    out = out.sort_values("date").drop_duplicates("date")
+    validate_wsteth_rate_shape(out)
+    return add_implied_yields_from_rate(out)
 
 def load_cf_eth_srr(csv_path: str | Path) -> pd.DataFrame:
     """
@@ -47,9 +148,15 @@ def load_cf_eth_srr(csv_path: str | Path) -> pd.DataFrame:
     cols = {c.lower().strip(): c for c in df.columns}
 
     date_col = cols.get("date") or cols.get("asofdate") or cols.get("timestamp") or cols.get("createdat")
+    # Primary regression yield priority: contract-rate wstETH implied yields first.
+    # DeFiLlama/APY-style fields are accepted only as fallback/robustness inputs
+    # and are never renamed to wsteth_implied_yield_* here.
     y_col = (
-        cols.get("eth_srr")
+        cols.get("wsteth_implied_yield_7d")
+        or cols.get("wsteth_implied_yield_30d")
+        or cols.get("eth_native_yield")
         or cols.get("stake_yield")
+        or cols.get("eth_srr")
         or cols.get("reward_rate")
         or cols.get("value")
         or cols.get("apr")
@@ -66,8 +173,26 @@ def load_cf_eth_srr(csv_path: str | Path) -> pd.DataFrame:
         "stake_yield": _normalize_yield_value(df[y_col]),
     }).dropna()
 
+    passthrough_cols = [
+        "wsteth_rate",
+        "wsteth_rate_block",
+        "wsteth_rate_source",
+        "wsteth_implied_yield_1d",
+        "wsteth_implied_yield_7d",
+        "wsteth_implied_yield_30d",
+        "eth_native_yield",
+        "wsteth_defillama_apy",
+        "wsteth_eth_basis",
+    ]
+    for name in passthrough_cols:
+        source_col = cols.get(name)
+        if source_col and source_col in df.columns:
+            out[name] = df.loc[out.index, source_col].values
+
     if "source" in cols:
         out["source"] = df.loc[out.index, cols["source"]].astype(str).values
+    elif "wsteth_rate_source" in out.columns:
+        out["source"] = out["wsteth_rate_source"].astype(str)
     else:
         out["source"] = "manual_cf_eth_srr"
 
@@ -142,6 +267,83 @@ def _find_block_at_or_before_timestamp(rpc_url: str, target_ts: int, latest_bloc
     return low
 
 
+
+def _find_closest_block_to_timestamp(rpc_url: str, target_ts: int, latest_block: int | None = None) -> int:
+    """Find the Ethereum block closest to a UTC timestamp."""
+    before = _find_block_at_or_before_timestamp(rpc_url, target_ts, latest_block=latest_block)
+    latest = latest_block if latest_block is not None else _latest_block_number(rpc_url)
+    before_ts = int(_get_block(rpc_url, before)["timestamp"], 16)
+    if before >= latest:
+        return before
+    after = before + 1
+    after_ts = int(_get_block(rpc_url, after)["timestamp"], 16)
+    return after if abs(after_ts - target_ts) < abs(target_ts - before_ts) else before
+
+
+def _load_date_block_csv(path: str | Path | None) -> pd.DataFrame:
+    if path is None or not Path(path).exists():
+        return pd.DataFrame(columns=["date", "block_number"])
+    df = pd.read_csv(path)
+    cols = {c.lower().strip(): c for c in df.columns}
+    date_col = cols.get("date") or cols.get("day") or cols.get("timestamp")
+    block_col = cols.get("block_number") or cols.get("block") or cols.get("wsteth_rate_block")
+    if not date_col or not block_col:
+        raise ValueError(f"Block CSV must contain date and block_number columns: {path}")
+    out = pd.DataFrame({
+        "date": _normalize_daily_date(df[date_col]),
+        "block_number": pd.to_numeric(df[block_col], errors="coerce"),
+    }).dropna()
+    out["block_number"] = out["block_number"].astype("int64")
+    return out.sort_values("date").drop_duplicates("date")
+
+
+def get_daily_blocks(
+    rpc_url: str,
+    dates: pd.DatetimeIndex,
+    sample_time_utc: str = "12:00:00",
+    eth_blocks_csv: str | Path | None = None,
+    block_cache_csv: str | Path | None = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Return date/block_number using user CSV, cache, and RPC binary search for misses."""
+    needed = pd.DataFrame({"date": pd.to_datetime(dates).normalize()}).drop_duplicates("date")
+    provided = _load_date_block_csv(eth_blocks_csv)
+    cached = _load_date_block_csv(block_cache_csv)
+    known = pd.concat([provided, cached], ignore_index=True).dropna().drop_duplicates("date", keep="first")
+    out = needed.merge(known, on="date", how="left")
+
+    missing_idx = out["block_number"].isna()
+    missing_dates = out.loc[missing_idx, "date"].tolist()
+    if missing_dates:
+        latest_block = _latest_block_number(rpc_url)
+        rows = []
+        for idx, date in enumerate(missing_dates, start=1):
+            if show_progress:
+                _print_progress("Ethereum block lookup", idx, len(missing_dates))
+            target_ts = int(pd.Timestamp(f"{date.date()} {sample_time_utc}", tz="UTC").timestamp())
+            rows.append({
+                "date": date,
+                "block_number": _find_closest_block_to_timestamp(rpc_url, target_ts, latest_block=latest_block),
+            })
+        if show_progress:
+            print()
+        fetched = pd.DataFrame(rows)
+        known = pd.concat([known, fetched], ignore_index=True).drop_duplicates("date", keep="first")
+        out = needed.merge(known, on="date", how="left")
+
+    out["block_number"] = pd.to_numeric(out["block_number"], errors="coerce").astype("Int64")
+    if block_cache_csv is not None:
+        cache_path = Path(block_cache_csv)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        known.sort_values("date").drop_duplicates("date").to_csv(cache_path, index=False)
+    return out.sort_values("date")
+
+
+def _get_steth_by_wsteth_call_data(amount_wei: int = ONE_WSTETH_WEI) -> str:
+    selector = _function_selector("getStETHByWstETH(uint256)")
+    encoded_amount = hex(int(amount_wei))[2:].rjust(64, "0")
+    return selector + encoded_amount
+
 def _eth_call_uint256(rpc_url: str, to_address: str, data: str, block_number: int) -> int:
     result = _rpc_post(
         rpc_url,
@@ -161,6 +363,120 @@ def _print_progress(prefix: str, current: int, total: int, width: int = 28) -> N
     percent = ratio * 100.0
     print(f"\r{prefix} [{bar}] {current}/{total} ({percent:5.1f}%)", end="", flush=True)
 
+
+
+def fetch_wsteth_contract_rate_history(
+    rpc_url: str,
+    start_date: str,
+    end_date: str | None = None,
+    sample_time_utc: str = "12:00:00",
+    eth_blocks_csv: str | Path | None = None,
+    block_cache_csv: str | Path | None = None,
+    rate_cache_csv: str | Path | None = None,
+    sleep_seconds: float = 0.0,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Fetch wstETH contract exchange-rate history via historical eth_call.
+
+    Uses wstETH.getStETHByWstETH(1e18) at each date's historical block and
+    stores the stETH claim per 1 wstETH as `wsteth_rate`. This is a protocol
+    exchange rate, not wstETH/ETH market price ratio or DeFiLlama APY.
+    """
+    start = pd.to_datetime(start_date, errors="raise").normalize()
+    end = (pd.to_datetime(end_date, errors="raise") if end_date else pd.Timestamp.utcnow()).normalize()
+    if end < start:
+        raise ValueError("end_date must be on or after start_date")
+    dates = pd.date_range(start=start, end=end, freq="D")
+    needed = pd.DataFrame({"date": dates})
+
+    cache = pd.DataFrame(columns=["date", "wsteth_rate", "wsteth_rate_block", "wsteth_rate_source"])
+    if rate_cache_csv is not None and Path(rate_cache_csv).exists():
+        cache_raw = pd.read_csv(rate_cache_csv)
+        cols = {c.lower().strip(): c for c in cache_raw.columns}
+        if "date" in cols and "wsteth_rate" in cols:
+            block_col = cols.get("wsteth_rate_block") or cols.get("block_number") or cols.get("block")
+            cache = pd.DataFrame({
+                "date": _normalize_daily_date(cache_raw[cols["date"]]),
+                "wsteth_rate": pd.to_numeric(cache_raw[cols["wsteth_rate"]], errors="coerce"),
+                "wsteth_rate_block": pd.to_numeric(cache_raw[block_col], errors="coerce") if block_col else pd.NA,
+            }).dropna(subset=["date", "wsteth_rate"])
+            cache["wsteth_rate_source"] = WSTETH_RATE_SOURCE
+            cache = cache.sort_values("date").drop_duplicates("date")
+
+    merged = needed.merge(cache, on="date", how="left")
+    missing_dates = merged.loc[merged["wsteth_rate"].isna(), "date"]
+    rows = []
+    if not missing_dates.empty:
+        blocks = get_daily_blocks(
+            rpc_url=rpc_url,
+            dates=pd.DatetimeIndex(missing_dates),
+            sample_time_utc=sample_time_utc,
+            eth_blocks_csv=eth_blocks_csv,
+            block_cache_csv=block_cache_csv,
+            show_progress=show_progress,
+        )
+        call_data = _get_steth_by_wsteth_call_data(ONE_WSTETH_WEI)
+        for idx, row in enumerate(blocks.itertuples(index=False), start=1):
+            if show_progress:
+                _print_progress("wstETH contract eth_call", idx, len(blocks))
+            block_number = int(row.block_number)
+            raw_rate = _eth_call_uint256(rpc_url, WSTETH_MAINNET_ADDRESS, call_data, block_number)
+            rows.append({
+                "date": row.date,
+                "wsteth_rate": raw_rate / 1e18,
+                "wsteth_rate_block": block_number,
+                "wsteth_rate_source": WSTETH_RATE_SOURCE,
+            })
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+        if show_progress:
+            print()
+
+    fetched = pd.DataFrame(rows)
+    combined = pd.concat([cache, fetched], ignore_index=True)
+    if combined.empty:
+        out = pd.DataFrame(columns=[
+            "date", "wsteth_rate", "wsteth_rate_block", "wsteth_rate_source",
+            "wsteth_implied_yield_1d", "wsteth_implied_yield_7d", "wsteth_implied_yield_30d",
+        ])
+    else:
+        combined = combined.sort_values("date").drop_duplicates("date", keep="last")
+        out = needed.merge(combined, on="date", how="left").dropna(subset=["wsteth_rate"])
+        out["wsteth_rate_source"] = WSTETH_RATE_SOURCE
+        out = add_implied_yields_from_rate(out)
+
+    if rate_cache_csv is not None and not combined.empty:
+        cache_path = Path(rate_cache_csv)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        combined.sort_values("date").to_csv(cache_path, index=False)
+    return out
+
+
+def print_wsteth_rate_summary(df: pd.DataFrame) -> None:
+    """Print source and sanity-check diagnostics for wstETH contract-rate yield."""
+    print("ETH LST yield source summary:")
+    if df.empty or "wsteth_rate" not in df:
+        print("WARNING: wstETH contract exchange-rate fetch failed. No primary ETH LST-implied yield was generated. DeFiLlama APY or market price ratios are not substitutes for wstETH_implied_yield.")
+        return
+    rates = pd.to_numeric(df["wsteth_rate"], errors="coerce").dropna()
+    y7 = pd.to_numeric(df.get("wsteth_implied_yield_7d", pd.Series(dtype=float)), errors="coerce").dropna()
+    source = str(df["wsteth_rate_source"].dropna().iloc[0]) if "wsteth_rate_source" in df.columns and df["wsteth_rate_source"].dropna().any() else WSTETH_RATE_SOURCE
+    method = "getStETHByWstETH(1e18) historical eth_call" if source == WSTETH_RATE_SOURCE else "user-supplied wstETH contract exchange-rate CSV"
+    print("- primary ETH yield source: wstETH contract exchange rate")
+    print(f"- method: {method}")
+    print(f"- source: {source}")
+    print(f"- wsteth_rate obs: {len(rates)}")
+    if not rates.empty:
+        print(f"- wsteth_rate start/end/min/max: {rates.iloc[0]:.8f} / {rates.iloc[-1]:.8f} / {rates.min():.8f} / {rates.max():.8f}")
+        negative_steps = int((rates.diff().dropna() < 0).sum())
+        if negative_steps > max(2, int(0.01 * max(len(rates) - 1, 1))):
+            print(f"WARNING: wsteth_rate has {negative_steps} negative daily steps; verify this is not a market ratio or bad data.")
+    if not y7.empty:
+        print(f"- wsteth_implied_yield_7d mean: {y7.mean():.6f}")
+        print(f"- wsteth_implied_yield_7d std/min/max: {y7.std():.6f} / {y7.min():.6f} / {y7.max():.6f}")
+        bad = int(((y7 < 0) | (y7.abs() > 0.50)).sum())
+        if bad > max(3, int(0.05 * len(y7))):
+            print(f"WARNING: {bad} wsteth_implied_yield_7d observations are negative or above 50% annualized; inspect rate/block data.")
 
 def fetch_lido_wsteth_share_rate_history(
     rpc_url: str,

@@ -35,9 +35,17 @@ END_DATE = datetime.now(timezone.utc).date().isoformat()
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 OUTPUT_DIR_RAW = ROOT / "data" / "raw"
 OUTPUT_DIR_PROCESSED = ROOT / "data" / "processed"
+ETH_YIELD_PRIORITY = [
+    "wsteth_implied_yield_7d",
+    "wsteth_implied_yield_30d",
+    "eth_native_yield",
+    "stake_yield",
+    "wsteth_defillama_apy",
+]
 LIDO_YIELD_CANDIDATES = [
-    OUTPUT_DIR_PROCESSED / "lido_staking_yield_daily.csv",
+    OUTPUT_DIR_PROCESSED / "funding_yield_panel.csv",
     OUTPUT_DIR_PROCESSED / "eth_yield_panel.csv",
+    OUTPUT_DIR_PROCESSED / "lido_staking_yield_daily.csv",
     OUTPUT_DIR_PROCESSED / "lido_eth_yield_panel.csv",
     OUTPUT_DIR_PROCESSED / "lido_yield_panel.csv",
     OUTPUT_DIR_PROCESSED / "lido_wsteth_share_rate.csv",
@@ -740,12 +748,17 @@ def load_lido_yield(path: str | Path | None = None) -> pd.DataFrame:
             df = pd.read_csv(p)
             if "stake_yield" not in df.columns and "annualized_apr_decimal" in df.columns:
                 df["stake_yield"] = df["annualized_apr_decimal"]
-            if not {"date", "stake_yield"}.issubset(df.columns):
-                raise ValueError(f"{p} must contain date and stake_yield columns")
-            df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
-            df["stake_yield"] = pd.to_numeric(df["stake_yield"], errors="coerce")
-            _warn_rate_scale(df, "stake_yield", "Lido staking yield")
-            return df[["date", "stake_yield"]].drop_duplicates("date").sort_values("date")
+            selected = next((col for col in ETH_YIELD_PRIORITY if col in df.columns and pd.to_numeric(df[col], errors="coerce").notna().any()), None)
+            if selected is None or "date" not in df.columns:
+                raise ValueError(f"{p} must contain date plus one ETH yield candidate: {ETH_YIELD_PRIORITY}")
+            if selected == "wsteth_defillama_apy":
+                print("[WARN] Using wsteth_defillama_apy only as robustness fallback; it is not contract implied yield.")
+            out = df[["date", selected]].copy().rename(columns={selected: "stake_yield"})
+            out["stake_yield_source"] = selected
+            out["date"] = pd.to_datetime(out["date"]).dt.date.astype(str)
+            out["stake_yield"] = pd.to_numeric(out["stake_yield"], errors="coerce")
+            _warn_rate_scale(out, "stake_yield", f"ETH yield ({selected})")
+            return out[["date", "stake_yield", "stake_yield_source"]].drop_duplicates("date").sort_values("date")
     print("[WARN] No Lido staking yield CSV found; master datasets will omit stake_yield until one is created.")
     return _empty(["date", "stake_yield"])
 
