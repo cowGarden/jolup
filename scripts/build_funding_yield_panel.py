@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,10 +29,17 @@ from common.yield_pipeline import (
 YIELD_PRIORITY = [
     "wsteth_implied_yield_7d",
     "wsteth_implied_yield_30d",
-    "eth_native_yield",
     "stake_yield",
+    "eth_native_yield",
     "wsteth_defillama_apy",  # robustness fallback only
 ]
+
+ASSET_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "XRP": "XRPUSDT",
+    "DOGE": "DOGEUSDT",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,8 +71,14 @@ def _date_filter(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFra
     return out[(out["date"] >= start) & (out["date"] <= end)].sort_values("date")
 
 
+def asset_to_symbol(asset: str) -> str:
+    """Map an asset ticker to the USDT perpetual symbol used by local funding files."""
+    asset_upper = asset.upper()
+    return ASSET_SYMBOLS.get(asset_upper, f"{asset_upper}USDT")
+
+
 def load_daily_funding(asset: str, args: argparse.Namespace) -> pd.DataFrame:
-    symbol = f"{asset.upper()}USDT"
+    symbol = asset_to_symbol(asset)
     processed_path = args.input_dir / f"{args.exchange}_{symbol}_funding_daily.csv"
     if processed_path.exists():
         df = pd.read_csv(processed_path)
@@ -97,7 +111,47 @@ def build_funding_panel(args: argparse.Namespace) -> pd.DataFrame:
     panel = panel.sort_values("date")
     panel["exchange"] = args.exchange
     panel["spread_btc_minus_eth"] = panel["f_btc"] - panel["f_eth"]
+    for asset in assets:
+        src = f"f_{asset.lower()}"
+        if src in panel.columns:
+            panel[f"{asset.lower()}_funding"] = panel[src]
     return panel
+
+
+def load_price_controls(args: argparse.Namespace) -> pd.DataFrame:
+    """Load optional ETH/BTC daily close files and build relative return/RV controls."""
+    candidates = {
+        "eth": [
+            args.raw_dir / "binance_ethusdt_1d.csv",
+            args.raw_dir / "binance_ETHUSDT_1d.csv",
+            args.input_dir / "binance_ETHUSDT_1d.csv",
+        ],
+        "btc": [
+            args.raw_dir / "binance_btcusdt_1d.csv",
+            args.raw_dir / "binance_BTCUSDT_1d.csv",
+            args.input_dir / "binance_BTCUSDT_1d.csv",
+        ],
+    }
+    frames = {}
+    for asset, paths in candidates.items():
+        path = next((p for p in paths if p.exists()), None)
+        if path is None:
+            continue
+        df = pd.read_csv(path)
+        if not {"date", "close"}.issubset(df.columns):
+            continue
+        tmp = _date_filter(df[["date", "close"]], args.start_date, args.end_date)
+        tmp[f"close_{asset}"] = pd.to_numeric(tmp["close"], errors="coerce")
+        frames[asset] = tmp[["date", f"close_{asset}"]]
+    if not {"eth", "btc"}.issubset(frames):
+        print("WARNING: ETH/BTC daily close files not found; ret_eth_btc and rv_eth_btc were not generated.")
+        return pd.DataFrame(columns=["date"])
+    out = frames["eth"].merge(frames["btc"], on="date", how="inner").sort_values("date")
+    ratio = out["close_eth"] / out["close_btc"]
+    clean_ratio = ratio.where(ratio > 0)
+    out["ret_eth_btc"] = np.log(clean_ratio).diff()
+    out["rv_eth_btc"] = out["ret_eth_btc"].rolling(7, min_periods=2).std() * (365.0 ** 0.5)
+    return out[["date", "ret_eth_btc", "rv_eth_btc"]]
 
 
 def load_fallback_yield(path: Path | None) -> pd.DataFrame:
@@ -173,6 +227,9 @@ def load_wsteth_rates(args: argparse.Namespace) -> pd.DataFrame:
 def main() -> None:
     args = parse_args()
     panel = build_funding_panel(args)
+    price_controls = load_price_controls(args)
+    if not price_controls.empty:
+        panel = panel.merge(price_controls, on="date", how="left")
     wsteth_rates = load_wsteth_rates(args)
     if not wsteth_rates.empty:
         panel = panel.merge(wsteth_rates, on="date", how="left")
@@ -183,6 +240,13 @@ def main() -> None:
             raise ValueError(f"Fallback yield CSV must not provide wsteth_implied_yield_* columns: {forbidden}")
         panel = panel.merge(fallback, on="date", how="left", suffixes=("", "_fallback"))
     panel = choose_primary_yield(panel)
+    for asset in [a.upper() for a in args.assets]:
+        expected = f"{asset.lower()}_funding"
+        if expected not in panel.columns:
+            print(f"WARNING: expected funding output column missing: {expected}")
+    for expected in ["ret_eth_btc", "rv_eth_btc"]:
+        if expected not in panel.columns:
+            print(f"WARNING: optional control column missing: {expected}")
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
     panel.to_csv(args.out_csv, index=False)
     print(f"Saved: {args.out_csv} ({len(panel):,} rows)")
