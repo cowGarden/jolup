@@ -82,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Delay between paginated exchange API requests.",
     )
+    p.add_argument(
+        "--fetch-basis",
+        action="store_true",
+        help="Collect/merge daily perp-spot basis columns for requested assets.",
+    )
+    p.add_argument(
+        "--basis-source",
+        default="auto",
+        choices=["auto", "mark_price", "perp_close_fallback"],
+        help="Perp price source for basis; auto tries mark price then futures close fallback.",
+    )
     p.add_argument("--fetch-onchain-lst-rates", action="store_true")
     p.add_argument("--ethereum-rpc-url", default=os.getenv("ETHEREUM_RPC_URL"))
     p.add_argument("--eth-blocks-csv", type=Path, default=None)
@@ -230,11 +241,16 @@ def fetch_bybit_funding_history(
     )
 
 
-def fetch_binance_daily_klines_history(
-    symbol: str, start_date: str, end_date: str, sleep_seconds: float = 0.2
+def fetch_binance_klines_history(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    url: str,
+    source_name: str,
+    sleep_seconds: float = 0.2,
 ) -> pd.DataFrame:
-    """Collect paginated Binance daily spot OHLCV history for ETH/BTC price controls."""
-    url = "https://api.binance.com/api/v3/klines"
+    """Collect paginated Binance 1d kline-style data and normalize OHLCV columns."""
     start_ms = _to_ms(_parse_date_utc(start_date))
     end_ms = _end_date_inclusive_ms(end_date)
     rows: list[list[object]] = []
@@ -248,13 +264,13 @@ def fetch_binance_daily_klines_history(
             "limit": 1000,
         }
         batch = _request_json(
-            url, params, source_name="Binance klines", sleep_seconds=sleep_seconds
+            url, params, source_name=source_name, sleep_seconds=sleep_seconds
         )
         if not batch:
             break
         if not isinstance(batch, list):
             raise RuntimeError(
-                f"Unexpected Binance kline payload for {symbol}: {batch}"
+                f"Unexpected {source_name} payload for {symbol}: {batch}"
             )
         rows.extend(batch)
         last_open = int(batch[-1][0])
@@ -264,23 +280,11 @@ def fetch_binance_daily_klines_history(
         current = next_ms
         if len(batch) < 1000:
             break
-    cols = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_asset_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore",
-    ]
-    df = pd.DataFrame(rows, columns=cols)
-    if df.empty:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    base_cols = ["open_time", "open", "high", "low", "close", "volume"]
+    if not rows:
+        return pd.DataFrame(columns=["date", *base_cols[1:]])
+    normalized_rows = [list(row[:6]) for row in rows]
+    df = pd.DataFrame(normalized_rows, columns=base_cols)
     df["date"] = (
         pd.to_datetime(df["open_time"], unit="ms", utc=True)
         .dt.tz_convert(None)
@@ -292,6 +296,48 @@ def fetch_binance_daily_klines_history(
         df[["date", "open", "high", "low", "close", "volume"]]
         .drop_duplicates("date")
         .sort_values("date")
+    )
+
+
+def fetch_binance_daily_klines_history(
+    symbol: str, start_date: str, end_date: str, sleep_seconds: float = 0.2
+) -> pd.DataFrame:
+    """Collect paginated Binance daily spot OHLCV history."""
+    return fetch_binance_klines_history(
+        symbol,
+        start_date,
+        end_date,
+        url="https://api.binance.com/api/v3/klines",
+        source_name="Binance spot klines",
+        sleep_seconds=sleep_seconds,
+    )
+
+
+def fetch_binance_futures_klines_history(
+    symbol: str, start_date: str, end_date: str, sleep_seconds: float = 0.2
+) -> pd.DataFrame:
+    """Collect paginated Binance USD-M futures daily OHLCV history."""
+    return fetch_binance_klines_history(
+        symbol,
+        start_date,
+        end_date,
+        url="https://fapi.binance.com/fapi/v1/klines",
+        source_name="Binance futures klines",
+        sleep_seconds=sleep_seconds,
+    )
+
+
+def fetch_binance_mark_price_klines_history(
+    symbol: str, start_date: str, end_date: str, sleep_seconds: float = 0.2
+) -> pd.DataFrame:
+    """Collect paginated Binance USD-M mark-price daily OHLC history."""
+    return fetch_binance_klines_history(
+        symbol,
+        start_date,
+        end_date,
+        url="https://fapi.binance.com/fapi/v1/markPriceKlines",
+        source_name="Binance mark-price klines",
+        sleep_seconds=sleep_seconds,
     )
 
 
@@ -446,6 +492,196 @@ def load_price_controls(args: argparse.Namespace) -> pd.DataFrame:
     return out[["date", "ret_eth_btc", "rv_eth_btc"]]
 
 
+def _kline_candidates(args: argparse.Namespace, symbol: str, kind: str) -> list[Path]:
+    lower = symbol.lower()
+    upper = symbol.upper()
+    if kind == "spot":
+        return [
+            args.raw_dir / f"binance_{lower}_1d.csv",
+            args.raw_dir / f"binance_{upper}_1d.csv",
+            args.raw_dir / f"binance_{lower}_spot_1d.csv",
+            args.input_dir / f"binance_{upper}_1d.csv",
+        ]
+    if kind == "mark":
+        return [
+            args.raw_dir / f"binance_{lower}_mark_1d.csv",
+            args.raw_dir / f"binance_{upper}_mark_1d.csv",
+            args.input_dir / f"binance_{upper}_mark_1d.csv",
+        ]
+    if kind == "perp":
+        return [
+            args.raw_dir / f"binance_{lower}_perp_1d.csv",
+            args.raw_dir / f"binance_{upper}_perp_1d.csv",
+            args.raw_dir / f"binance_{lower}_futures_1d.csv",
+            args.input_dir / f"binance_{upper}_perp_1d.csv",
+        ]
+    raise ValueError(f"Unknown kline kind: {kind}")
+
+
+def _load_or_collect_binance_klines(
+    symbol: str, kind: str, args: argparse.Namespace
+) -> pd.DataFrame:
+    path = next((p for p in _kline_candidates(args, symbol, kind) if p.exists()), None)
+    if path is not None:
+        df = pd.read_csv(path)
+    else:
+        if getattr(args, "skip_fetch_missing", False):
+            return pd.DataFrame(
+                columns=["date", "open", "high", "low", "close", "volume"]
+            )
+        args.raw_dir.mkdir(parents=True, exist_ok=True)
+        if kind == "spot":
+            df = fetch_binance_daily_klines_history(
+                symbol, args.start_date, args.end_date, args.request_sleep_seconds
+            )
+            path = args.raw_dir / f"binance_{symbol.lower()}_spot_1d.csv"
+        elif kind == "mark":
+            df = fetch_binance_mark_price_klines_history(
+                symbol, args.start_date, args.end_date, args.request_sleep_seconds
+            )
+            path = args.raw_dir / f"binance_{symbol.lower()}_mark_1d.csv"
+        elif kind == "perp":
+            df = fetch_binance_futures_klines_history(
+                symbol, args.start_date, args.end_date, args.request_sleep_seconds
+            )
+            path = args.raw_dir / f"binance_{symbol.lower()}_perp_1d.csv"
+        else:
+            raise ValueError(f"Unknown kline kind: {kind}")
+        if not df.empty:
+            df.to_csv(path, index=False)
+            print(f"[INFO] Saved {kind} klines: {path} ({len(df):,} rows)")
+    if not {"date", "close"}.issubset(df.columns):
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    keep = [
+        col
+        for col in ["date", "open", "high", "low", "close", "volume"]
+        if col in df.columns
+    ]
+    out = _date_filter(df[keep], args.start_date, args.end_date)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def build_basis_panel(args: argparse.Namespace) -> pd.DataFrame:
+    """Build daily perp-spot basis columns for requested Binance assets."""
+    if not getattr(args, "fetch_basis", False):
+        return pd.DataFrame(columns=["date"])
+    if args.exchange != "binance":
+        print(
+            "WARNING: --fetch-basis currently supports Binance symbols only; skipping basis."
+        )
+        return pd.DataFrame(columns=["date"])
+
+    panel: pd.DataFrame | None = None
+    for asset in [a.upper() for a in args.assets]:
+        symbol = asset_to_symbol(asset)
+        prefix = asset.lower()
+        spot = _load_or_collect_binance_klines(symbol, "spot", args)
+        if spot.empty:
+            print(
+                f"WARNING: missing spot klines for {symbol}; skipping {prefix}_basis."
+            )
+            continue
+
+        mark = pd.DataFrame()
+        mark_error: Exception | None = None
+        if args.basis_source in {"auto", "mark_price"}:
+            try:
+                mark = _load_or_collect_binance_klines(symbol, "mark", args)
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 - basis can fall back to futures close.
+                mark_error = exc
+                mark = pd.DataFrame()
+                print(
+                    f"WARNING: mark-price basis fetch/load failed for {symbol}: {exc}"
+                )
+        if args.basis_source == "mark_price" and mark.empty:
+            detail = f" ({mark_error})" if mark_error else ""
+            print(
+                f"WARNING: mark-price basis unavailable for {symbol}{detail}; skipping asset."
+            )
+            continue
+
+        perp = pd.DataFrame()
+        basis_source = "mark_price"
+        if mark.empty:
+            perp = _load_or_collect_binance_klines(symbol, "perp", args)
+            basis_source = "perp_close_fallback"
+            if perp.empty:
+                print(
+                    f"WARNING: missing futures close fallback for {symbol}; skipping {prefix}_basis."
+                )
+                continue
+        source_df = mark if basis_source == "mark_price" else perp
+        merged = spot[["date", "close"]].rename(
+            columns={"close": f"{prefix}_spot_close"}
+        )
+        price_cols = ["date", "close"]
+        for optional_col in ["open", "high", "low"]:
+            if optional_col in source_df.columns:
+                price_cols.append(optional_col)
+        rhs = source_df[price_cols].copy()
+        if basis_source == "mark_price":
+            rhs = rhs.rename(columns={"close": f"{prefix}_perp_mark"})
+        else:
+            rhs = rhs.rename(columns={"close": f"{prefix}_perp_close"})
+        merged = merged.merge(rhs, on="date", how="inner")
+
+        perp_price_col = (
+            f"{prefix}_perp_mark"
+            if basis_source == "mark_price"
+            else f"{prefix}_perp_close"
+        )
+        merged[f"{prefix}_basis_close"] = (
+            merged[perp_price_col] / merged[f"{prefix}_spot_close"] - 1.0
+        )
+        merged[f"{prefix}_basis"] = merged[f"{prefix}_basis_close"]
+        if {"open", "high", "low"}.issubset(merged.columns):
+            avg_perp = merged[["open", "high", "low", perp_price_col]].mean(axis=1)
+            merged[f"{prefix}_basis_avg"] = (
+                avg_perp / merged[f"{prefix}_spot_close"] - 1.0
+            )
+        else:
+            merged[f"{prefix}_basis_avg"] = merged[f"{prefix}_basis_close"]
+        merged[f"{prefix}_basis_source"] = basis_source
+
+        keep_cols = [
+            "date",
+            f"{prefix}_spot_close",
+            perp_price_col,
+            f"{prefix}_basis",
+            f"{prefix}_basis_close",
+            f"{prefix}_basis_avg",
+            f"{prefix}_basis_source",
+        ]
+        if (
+            basis_source == "mark_price"
+            and f"{prefix}_perp_close" not in merged.columns
+        ):
+            merged[f"{prefix}_perp_close"] = np.nan
+            keep_cols.insert(3, f"{prefix}_perp_close")
+        if (
+            basis_source == "perp_close_fallback"
+            and f"{prefix}_perp_mark" not in merged.columns
+        ):
+            merged[f"{prefix}_perp_mark"] = np.nan
+            keep_cols.insert(2, f"{prefix}_perp_mark")
+        print(
+            f"[INFO] Built {prefix}_basis with source={basis_source} ({len(merged):,} rows)"
+        )
+        panel = (
+            merged[keep_cols]
+            if panel is None
+            else panel.merge(merged[keep_cols], on="date", how="outer")
+        )
+    if panel is None:
+        return pd.DataFrame(columns=["date"])
+    return panel.sort_values("date")
+
+
 def load_fallback_yield(path: Path | None) -> pd.DataFrame:
     if path is None or not path.exists():
         return pd.DataFrame(columns=["date"])
@@ -572,6 +808,8 @@ def main() -> None:
     panel = build_funding_panel(args)
     price_controls = load_price_controls(args)
     panel = merge_without_overwriting(panel, price_controls)
+    basis_panel = build_basis_panel(args)
+    panel = merge_without_overwriting(panel, basis_panel)
     eth_yield_panel = load_eth_yield_panel(args.eth_yield_panel_csv, args)
     panel = merge_without_overwriting(panel, eth_yield_panel)
     wsteth_rates = load_wsteth_rates(args)
